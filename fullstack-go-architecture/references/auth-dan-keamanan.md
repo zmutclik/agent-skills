@@ -10,22 +10,22 @@ Path import memakai module `app`. Dependensi tambahan satu-satunya: `golang.org/
 -- +goose Up
 CREATE TABLE users (
   id            BIGINT AUTO_INCREMENT PRIMARY KEY,
-  username      VARCHAR(64)  NOT NULL,          -- collation default *_ci: unik tanpa beda huruf besar/kecil
+  username      VARCHAR(64)  NOT NULL,          -- unicode_ci: unik tanpa beda huruf besar/kecil & aksen
   password_hash VARCHAR(100) NOT NULL,          -- bcrypt (60 karakter)
   role          VARCHAR(32)  NOT NULL,          -- kunci di authz.roles
   is_active     BOOLEAN      NOT NULL DEFAULT TRUE,
   created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uq_users_username (username)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE login_failures (
   id         BIGINT AUTO_INCREMENT PRIMARY KEY,
-  key_hash   BINARY(32) NOT NULL,               -- SHA-256 "u:<username>" atau "ip:<alamat>"
+  key_hash   BINARY(32) NOT NULL,               -- SHA-256 "u:<WEIGHT_STRING username>" atau "ip:<alamat|/64>"
   created_at DATETIME   NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_login_failures_key (key_hash, created_at),
   KEY idx_login_failures_created (created_at)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE audit_log (
   id         BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -39,7 +39,7 @@ CREATE TABLE audit_log (
   created_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_audit_entity (entity, entity_id, created_at),
   KEY idx_audit_user (user_id, created_at)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- +goose Down
 DROP TABLE audit_log;
@@ -47,7 +47,8 @@ DROP TABLE login_failures;
 DROP TABLE users;
 ```
 
-- Username memakai collation default `utf8mb4_*_ci`, jadi `Budi` dan `budi` dianggap user yang sama.
+- Charset & collation ditulis eksplisit di setiap `CREATE TABLE`. Kalau tidak, tabel mengikuti default server, yang di instalasi MariaDB bawaan masih `latin1`.
+- Username memakai `utf8mb4_unicode_ci`, jadi `Budi`, `budi`, dan `búdi` dianggap user yang sama. Karena itu kunci batas percobaan login adalah bentuk kanonik username menurut collation ini (`LoginThrottleKey`), bukan teks yang diketik (§4). Kalau collation `users.username` diganti, collation di query itu ikut diganti.
 - `login_failures` hanya menyimpan hash kunci. Username yang salah ketik sering berisi password, jadi tidak disimpan mentah.
 - `audit_log` hanya pernah di-`INSERT` oleh aplikasi. User DB aplikasi tidak diberi hak `UPDATE`/`DELETE` di tabel ini (SKILL §12.2).
 
@@ -64,11 +65,19 @@ INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?);
 -- name: UpdateUserPassword :exec
 UPDATE users SET password_hash = ? WHERE id = ?;
 
+-- name: LoginThrottleKey :one
+-- Bentuk kanonik username menurut collation users.username (WAJIB sama): semua varian
+-- yang login ke akun yang sama ("budi", "Budi", "búdi") menghasilkan kunci yang sama,
+-- juga untuk username yang tidak terdaftar. COLLATE ditaruh di kolom tabel turunan,
+-- karena sqlc v1.30 diam-diam membuang parameter di dalam COLLATE / CONVERT ... USING.
+SELECT WEIGHT_STRING(i.name COLLATE utf8mb4_unicode_ci) AS throttle_key
+FROM (SELECT CAST(sqlc.arg(username) AS CHAR) AS name) AS i;
+
 -- name: CountLoginFailures :one
 SELECT COUNT(*) FROM login_failures
 WHERE key_hash = ? AND created_at > DATE_SUB(NOW(), INTERVAL CAST(sqlc.arg(window_seconds) AS SIGNED) SECOND);
 
--- name: InsertLoginFailure :exec
+-- name: InsertLoginFailure :execlastid
 INSERT INTO login_failures (key_hash) VALUES (?);
 
 -- name: ListLoginFailureIDs :many
@@ -253,67 +262,104 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
-	"strings"
+	"fmt"
+	"net/netip"
 	"time"
 
-	"app/internal/database"
 	"app/internal/store"
 )
 
 const (
 	throttleWindow  = 15 * time.Minute
-	maxUserFailures = 5  // per username per window
+	maxUserFailures = 5  // per akun per window
 	maxIPFailures   = 30 // per IP per window; longgar karena satu klinik bisa keluar lewat satu IP NAT
 )
 
 // Throttle: batas percobaan login di MariaDB (tanpa Redis). Jendela geser: kegagalan
 // lebih tua dari throttleWindow tidak dihitung, jadi blokir lepas sendiri.
 type Throttle struct {
-	db *sql.DB
-	q  *store.Queries
+	q *store.Queries
 }
 
-func NewThrottle(db *sql.DB) *Throttle { return &Throttle{db: db, q: store.New(db)} }
+func NewThrottle(db *sql.DB) *Throttle { return &Throttle{q: store.New(db)} }
 
+// UserKey: kunci per username = bentuk kanonik menurut collation users.username, dihitung
+// MariaDB. Collation _ci (juga mengabaikan aksen) membuat "budi", "Budi", dan "búdi" login
+// ke akun yang sama; kalau kuncinya teks yang diketik, tiap varian mendapat jatah
+// percobaan sendiri. Username tak dikenal diperlakukan sama persis, sehingga perilaku
+// blokir tidak membocorkan apakah sebuah username terdaftar.
 // Kunci di-hash: username yang salah ketik sering berisi password, jadi tidak disimpan mentah.
-func userKey(username string) []byte {
-	h := sha256.Sum256([]byte("u:" + strings.ToLower(username)))
-	return h[:]
+func (t *Throttle) UserKey(ctx context.Context, username string) ([]byte, error) {
+	v, err := t.q.LoginThrottleKey(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	w, ok := v.([]byte) // sqlc tidak tahu tipe WEIGHT_STRING; driver mengembalikan []byte
+	if !ok {
+		return nil, fmt.Errorf("throttle key: tipe tak terduga %T", v)
+	}
+	h := sha256.Sum256(append([]byte("u:"), w...))
+	return h[:], nil
 }
 
+// ipKey: IPv6 dihitung per /64, karena satu pelanggan biasanya memegang satu /64 utuh
+// dan bisa berganti alamat di dalamnya untuk lolos dari batas per alamat.
 func ipKey(ip string) []byte {
+	if a, err := netip.ParseAddr(ip); err == nil && a.Is6() && !a.Is4In6() {
+		if p, err := a.Prefix(64); err == nil {
+			ip = p.String()
+		}
+	}
 	h := sha256.Sum256([]byte("ip:" + ip))
 	return h[:]
 }
 
-// Blocked dicek SEBELUM bcrypt, supaya percobaan yang sudah diblokir tidak memakan CPU.
-func (t *Throttle) Blocked(ctx context.Context, username, ip string) (bool, error) {
-	win := int64(throttleWindow / time.Second)
-	n, err := t.q.CountLoginFailures(ctx, store.CountLoginFailuresParams{KeyHash: userKey(username), WindowSeconds: win})
-	if err != nil || n >= maxUserFailures {
-		return err == nil, err
+// Attempt = baris login_failures milik percobaan yang sedang berjalan.
+type Attempt struct{ userRow, ipRow int64 }
+
+// Begin dipanggil SEBELUM bcrypt. Percobaan dicatat lebih dulu sebagai kegagalan, BARU
+// dihitung (hitungan sudah termasuk dirinya). Kalau dibalik (hitung lalu catat setelah
+// bcrypt), ratusan request paralel lolos pengecekan bersamaan selagi hitungannya masih 0.
+// Kedua INSERT sengaja tanpa transaksi: harus sudah commit, supaya terlihat oleh request
+// paralel. Setiap request melihat semua catatan yang commit sebelum hitungannya, jadi
+// paling banyak maxUserFailures percobaan per akun yang sampai ke bcrypt.
+//
+// Percobaan yang diblokir menghapus catatannya lagi. Tanpa itu, penyerang yang terus
+// mencoba membuat akun target terkunci tanpa batas, bukan hanya selama throttleWindow.
+// Kalau proses gagal di tengah (error DB, ctx habis), catatan tetap ada dan dihitung gagal.
+func (t *Throttle) Begin(ctx context.Context, uk []byte, ip string) (a Attempt, blocked bool, err error) {
+	if a.userRow, err = t.q.InsertLoginFailure(ctx, uk); err != nil {
+		return a, false, err
 	}
-	n, err = t.q.CountLoginFailures(ctx, store.CountLoginFailuresParams{KeyHash: ipKey(ip), WindowSeconds: win})
-	return err == nil && n >= maxIPFailures, err
+	if a.ipRow, err = t.q.InsertLoginFailure(ctx, ipKey(ip)); err != nil {
+		return a, false, err
+	}
+	win := int64(throttleWindow / time.Second)
+	nu, err := t.q.CountLoginFailures(ctx, store.CountLoginFailuresParams{KeyHash: uk, WindowSeconds: win})
+	if err != nil {
+		return a, false, err
+	}
+	ni, err := t.q.CountLoginFailures(ctx, store.CountLoginFailuresParams{KeyHash: ipKey(ip), WindowSeconds: win})
+	if err != nil {
+		return a, false, err
+	}
+	if nu > maxUserFailures || ni > maxIPFailures {
+		_, err = t.q.DeleteLoginFailures(ctx, []int64{a.userRow, a.ipRow})
+		return a, true, err
+	}
+	return a, false, nil
 }
 
-func (t *Throttle) Fail(ctx context.Context, username, ip string) error {
-	return database.InTx(ctx, t.db, func(q *store.Queries) error {
-		if err := q.InsertLoginFailure(ctx, userKey(username)); err != nil {
-			return err
-		}
-		return q.InsertLoginFailure(ctx, ipKey(ip))
-	})
-}
-
-// Success menghapus kegagalan milik username saja. Counter IP sengaja tidak di-reset:
-// penyerang yang punya satu akun valid tidak bisa memakainya untuk me-reset batas IP.
-func (t *Throttle) Success(ctx context.Context, username string) error {
-	ids, err := t.q.ListLoginFailureIDs(ctx, userKey(username))
-	if err != nil || len(ids) == 0 {
+// Success menghapus semua kegagalan milik akun ini, ditambah catatan IP milik percobaan
+// sukses ini saja. Kegagalan IP sebelumnya sengaja tidak di-reset: penyerang yang punya
+// satu akun valid tidak bisa memakainya untuk me-reset batas IP.
+// Gagal login tidak perlu memanggil apa pun: catatan dari Begin sudah menjadi kegagalannya.
+func (t *Throttle) Success(ctx context.Context, a Attempt, uk []byte) error {
+	ids, err := t.q.ListLoginFailureIDs(ctx, uk)
+	if err != nil {
 		return err
 	}
-	_, err = t.q.DeleteLoginFailures(ctx, ids)
+	_, err = t.q.DeleteLoginFailures(ctx, append(ids, a.ipRow))
 	return err
 }
 
@@ -394,7 +440,12 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	password := r.PostFormValue("password")
 	ip := middleware.ClientIP(ctx)
 
-	blocked, err := h.throttle.Blocked(ctx, username, ip)
+	uk, err := h.throttle.UserKey(ctx, username) // sama untuk semua varian huruf/aksen
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	attempt, blocked, err := h.throttle.Begin(ctx, uk, ip) // dicatat SEBELUM bcrypt
 	if err != nil {
 		h.fail(w, r, err)
 		return
@@ -416,10 +467,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok || !user.IsActive {
 		// Satu pesan untuk username tak dikenal, password salah, dan user nonaktif.
-		if err := h.throttle.Fail(ctx, username, ip); err != nil {
-			h.fail(w, r, err)
-			return
-		}
+		// Kegagalan sudah tercatat oleh Begin.
 		if err := audit.Write(ctx, h.q, audit.Entry{Action: "login_failed", Entity: "user",
 			EntityID: idString(user.ID), UserID: user.ID}); err != nil {
 			h.fail(w, r, err)
@@ -429,7 +477,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.throttle.Success(ctx, username); err != nil {
+	if err := h.throttle.Success(ctx, attempt, uk); err != nil {
 		h.fail(w, r, err)
 		return
 	}
@@ -511,10 +559,11 @@ func idString(id int64) string {
 
 Alurnya, dan alasan urutannya:
 
-1. **Cek blokir dulu**, sebelum lookup user dan bcrypt. Percobaan yang sudah diblokir tidak memakan CPU (terukur < 100 ms walau `-race`).
-2. **bcrypt selalu jalan**, juga untuk username yang tidak ada (memakai hash dummy). Dengan begitu waktu respons tidak membocorkan username mana yang terdaftar (terukur 203 ms vs 212 ms).
-3. **Satu pesan error** untuk username tak dikenal, password salah, dan user nonaktif.
-4. Sukses: kegagalan milik username dihapus, session dibuat (rotasi), audit `login`, lalu hash di-upgrade kalau cost-nya lama.
+1. **Kunci throttle = bentuk kanonik username** menurut collation (`Throttle.UserKey`). Varian huruf besar/kecil atau aksen dari satu username tidak mendapat jatah percobaan sendiri-sendiri, baik username itu terdaftar maupun tidak.
+2. **Catat percobaan, baru hitung** (`Throttle.Begin`), sebelum lookup user dan bcrypt. Urutan ini yang membuat request paralel tidak bisa lolos bersamaan: paling banyak 5 percobaan per akun yang sampai ke bcrypt. Percobaan yang diblokir menghapus catatannya lagi dan tidak memakan CPU bcrypt.
+3. **bcrypt selalu jalan**, juga untuk username yang tidak ada (memakai hash dummy). Dengan begitu waktu respons tidak membocorkan username mana yang terdaftar (terukur 203 ms vs 212 ms).
+4. **Satu pesan error** untuk username tak dikenal, password salah, dan user nonaktif. Catatan dari langkah 2 menjadi kegagalannya.
+5. Sukses: kegagalan milik akun dan catatan IP percobaan ini dihapus, session dibuat (rotasi), audit `login`, lalu hash di-upgrade kalau cost-nya lama.
 
 Menambah atau mengubah user (form admin, perintah bootstrap) wajib memanggil `auth.ValidatePassword` lalu `hasher.Hash`. Setelah ganti password atau menonaktifkan user, panggil `q.DeleteUserSessions(ctx, userID)` supaya semua perangkat ter-logout.
 
@@ -747,7 +796,7 @@ func SecurityHeaders(hsts bool) func(http.Handler) http.Handler {
 // cmd/server/main.go (potongan, lengkapnya di struktur-project §5.1)
 log := slog.New(middleware.LogHandler(slog.NewJSONHandler(os.Stdout, nil)))
 
-sessions := session.NewStore(q, cfg.SessionTTL, cfg.CookieSecure)
+sessions := session.NewStore(q, cfg.SessionTTL, cfg.SessionMaxAge, cfg.CookieSecure)
 auth := middleware.NewAuth(sessions, log)
 authh.NewHandler(db, sessions, authh.NewHasher(), view, log).Routes(mux, auth) // import authh "app/internal/auth"
 
@@ -782,7 +831,7 @@ CSP di §7 tidak mengizinkan `'unsafe-inline'` maupun `'unsafe-eval'`. Agar HTMX
 
 ```html
 <!-- web/layout/base.html, di dalam <head> -->
-<meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false}'>
+<meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"historyCacheSize":0}'>
 <link rel="stylesheet" href="/static/css/app.css?v={{version}}">
 <script src="/static/js/htmx.min.js?v={{version}}" defer></script>
 <script src="/static/js/app.js?v={{version}}" defer></script>
@@ -840,3 +889,21 @@ Kode di dokumen ini (salinan persis dari kode yang diuji) di-generate dengan sql
 | Cookie di HTTPS / HTTP | `__Host-session_id` Secure / `session_id` |
 | Log | setiap baris ber-context membawa `request_id` |
 | `cleanup` login_failures | hanya baris lebih tua dari jendela yang terhapus |
+
+**Revisi review 2026-10-10** (throttle "catat dulu, baru hitung", kunci kanonik menurut collation, IPv6 per /64, collation eksplisit). Kode di atas diekstrak langsung dari dokumen ini, `sqlc generate` + `sqlc diff` bersih, lolos `go vet` + `gofmt`, dan diuji `go test -race` dengan Go 1.27.2, sqlc v1.30.0, dan MariaDB 10.11.13:
+
+| Skenario | Hasil |
+|---|---|
+| MariaDB 10.11 bawaan tanpa konfigurasi | `character_set_server = latin1`, jadi charset wajib ditulis di `CREATE TABLE` |
+| `búdi` / `BÙDÎ` vs user `budi` di `utf8mb4_unicode_ci`, `utf8mb4_general_ci`, dan `latin1` default | ketiganya cocok (login ke akun yang sama) |
+| **Algoritma lama** (hitung → bcrypt → catat): 200 percobaan paralel ke satu akun | **200 dari 200** sampai ke bcrypt (batas seharusnya 5) |
+| Algoritma baru: 200 percobaan paralel dari 200 IP berbeda, diulang 3× | 0–1 sampai ke bcrypt per gelombang, sisanya 429; ditambah 20 percobaan berurutan, total yang sampai ke bcrypt **tepat 5**; password benar sesudahnya → 429 |
+| 5 gagal dengan `budi`, `Budi`, `búdi`, `bùdi`, `büdi`, lalu `bûdi` / `BÚDÍ` | 429 (satu jatah per akun) |
+| 5 gagal dengan username **tak terdaftar** `tidakada`, lalu `tidakadá` / `TÏDAKADA` | 429, sama seperti username terdaftar (tidak ada oracle keberadaan akun) |
+| `WEIGHT_STRING` `utf8mb4_unicode_ci`: `budi` vs `BÚDÎ` / `bud` | sama / beda |
+| sqlc v1.30: parameter di dalam `COLLATE` atau `CONVERT(... USING ...)` | **dibuang diam-diam** (fungsi Go tanpa argumen); bentuk tabel turunan di `LoginThrottleKey` benar |
+| 10 percobaan yang diblokir | tidak menambah baris `login_failures` |
+| 3 gagal lalu sukses dari IP yang sama | kegagalan akun terhapus; kegagalan IP tetap 3 (catatan percobaan sukses ikut dihapus) |
+| `2001:db8:1:2::1` vs `2001:db8:1:2:ffff:…` / `2001:db8:1:3::1`; dua alamat IPv4 | kunci sama / beda; IPv4 tetap per alamat |
+
+Di bawah serangan paralel, percobaan sah yang datang bersamaan bisa ikut mendapat 429, karena catatan percobaan yang sedang berjalan ikut terhitung sesaat. Ini sengaja: lebih baik salah blokir sebentar daripada meloloskan tebakan.

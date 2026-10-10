@@ -173,6 +173,7 @@ document.addEventListener('htmx:beforeSwap', (evt) => {
 8. **Lolos Content-Security-Policy tanpa `'unsafe-inline'`/`'unsafe-eval'`** (header-nya dipasang `SecurityHeaders`, §8.6). Dengan CSP ini, HTML hasil injeksi tidak bisa menjalankan script. Konsekuensinya:
    - Alpine memakai **build CSP** (`@alpinejs/csp`). Ekspresi sederhana di atribut tetap boleh (`x-data="{ open: false }"`, `@click="open = !open"`, `x-show="count > 3"`), tapi arrow function, template literal, akses global (`document`, `Math`, `console`), dan `x-html` berisi input user tidak boleh.
    - htmx dikonfigurasi `allowEval:false`, `allowScriptTags:false`, `includeIndicatorStyles:false` lewat `<meta name="htmx-config">`, sehingga `hx-on:*`, filter event (`hx-trigger="click[ctrlKey]"`), dan `hx-vals='js:...'` tidak dipakai.
+   - `historyCacheSize:0` di config yang sama: htmx tidak menyimpan snapshot halaman ke `sessionStorage`/`localStorage` (alasannya di §8.5).
    - Tidak ada `<script>` inline, atribut `onclick=`, atau `style="..."` di template. Semuanya lewat file di `/static` dan class CSS.
 
    Tabel pengganti dan CSS indikator htmx ada di [auth-dan-keamanan §9](references/auth-dan-keamanan.md). Putuskan ini sejak awal, karena memasang CSP ketat di aplikasi yang sudah penuh script inline jauh lebih mahal.
@@ -306,7 +307,7 @@ Aturan yang tidak boleh dilanggar:
 - **Index** untuk kolom filter/join/order. Cek dengan `EXPLAIN` sebelum query masuk `queries/*.sql`.
 - **Hindari N+1** — sqlc tidak punya lazy-load, jadi N+1 muncul sebagai query di dalam loop Go. Ganti dengan `JOIN` atau satu query `WHERE id IN (sqlc.slice('ids'))`.
 - **Pagination** dengan `LIMIT` + keyset (`WHERE id < ?`) untuk tabel besar. `OFFSET` besar akan memindai banyak baris.
-- **Batas waktu di sisi server**: membatalkan `ctx` hanya memutus koneksi di sisi Go, sedangkan query bisa tetap jalan di MariaDB. Tambahkan `&max_statement_time=10` di DSN (driver menjalankan `SET` saat koneksi dibuka) sebagai pengaman untuk seluruh pool. Kalau ada laporan berat yang butuh waktu lebih lama, buat pool kedua dengan nilai lebih besar. Jangan pakai `SET STATEMENT ... FOR` per query (tidak dikenali sqlc, lihat struktur-project §6).
+- **Batas waktu di sisi server**: membatalkan `ctx` hanya memutus koneksi di sisi Go, sedangkan query bisa tetap jalan di MariaDB. `database.Open` men-set `max_statement_time` (dari config, mis. 10 detik) untuk setiap koneksi (§6.1), sebagai pengaman untuk seluruh pool. Kalau ada laporan berat yang butuh waktu lebih lama, buat pool kedua dengan nilai lebih besar. Jangan pakai `SET STATEMENT ... FOR` per query (tidak dikenali sqlc, lihat struktur-project §6).
 - **Waktu dihitung di SQL dengan `NOW()`**, bukan `time.Now()` dari Go, untuk semua perbandingan seperti expiry, `run_at`, dan lock (pola sqlc-nya di struktur-project §6). Dengan begitu tidak ada selisih jam antara server aplikasi dan DB, dan zona `NOW()` sama dengan zona Go (§6.1).
 - Aktifkan **slow query log** dan periksa secara berkala.
 
@@ -314,7 +315,7 @@ Aturan yang tidak boleh dilanggar:
 
 - Transaksi yang lama terbuka menahan row lock. Cek dengan `SELECT * FROM information_schema.INNODB_TRX ORDER BY trx_started;`.
 - `SELECT ... FOR UPDATE` selalu dalam urutan yang sama (mis. urut ID) supaya tidak deadlock.
-- **`UPDATE`/`DELETE` massal pada tabel yang ramai ditulis: cari ID dulu, lalu ubah lewat PK.** `UPDATE/DELETE ... WHERE <kondisi range>` dicari lewat secondary index, jadi mengunci *index → PK*, termasuk record pertama **sesudah** range karena batas range baru dicek setelah lock diambil. Sementara itu, `UPDATE ... WHERE id = ?` biasa mengunci *PK → index*. Urutan yang berlawanan ini menghasilkan deadlock, baik di REPEATABLE READ maupun READ COMMITTED, dan index tambahan tidak menolong. Polanya: `SELECT id ... LIMIT 1000` (tanpa lock), lalu `UPDATE/DELETE ... WHERE id IN (sqlc.slice('ids')) AND <kondisi diulang>`. Contohnya `ReclaimJobs` dan `DeleteJobs` di [antrean-dan-session §2](references/antrean-dan-session.md).
+- **`UPDATE`/`DELETE` massal pada tabel yang ramai ditulis: cari ID dulu, lalu ubah lewat PK.** `UPDATE/DELETE ... WHERE <kondisi range>` dicari lewat secondary index, jadi mengunci *index → PK*, termasuk record pertama **sesudah** range karena batas range baru dicek setelah lock diambil. Sementara itu, `UPDATE ... WHERE id = ?` biasa mengunci *PK → index*. Urutan yang berlawanan ini menghasilkan deadlock, baik di REPEATABLE READ maupun READ COMMITTED, dan index tambahan tidak menolong. Polanya: `SELECT id ... LIMIT 1000` (tanpa lock), lalu `UPDATE/DELETE ... WHERE id IN (sqlc.slice('ids')) AND <kondisi diulang>`. Contohnya `ReclaimJobs` dan `DeleteJobs` di [antrean-dan-session §2](references/antrean-dan-session.md). Cek `EXPLAIN` dengan data yang realistis: harus `key=PRIMARY`. Kondisi yang diulang bisa membuat optimizer memilih secondary index lagi (terbukti pada tabel `sessions` yang PK-nya `BINARY(32)`); kalau begitu, hapus kondisinya selama aman (contoh: `DeleteExpiredSessions`).
 - Deadlock (1213) dan lock wait timeout (1205) boleh di-retry 1–2 kali dengan mengulang **seluruh** `InTx`, bukan hanya query terakhir, karena transaksinya sudah di-rollback oleh MariaDB. Cek dengan helper di `internal/database`:
 
 ```go
@@ -384,10 +385,11 @@ Aturan:
 - **Handler menghormati `ctx`** (`JobTimeout`, urutannya di §4.4). Kalau handler mengabaikan ctx dan berjalan melewati `LockFor`, job di-reclaim dan dijalankan dua kali.
 - **Error permanen** (payload rusak, data sudah tidak valid): `return fmt.Errorf("...: %w", jobs.ErrPermanent)`, job langsung `failed` tanpa retry. Job `failed` wajib dipantau (§10); query untuk menjalankannya ulang ada di [antrean-dan-session §8](references/antrean-dan-session.md).
 - **Worker = proses terpisah** dengan pool sendiri: `MaxOpen_worker ≥ Concurrency + 2` (satu untuk loop claim/maintenance, satu cadangan), dan masuk hitungan anggaran §6.1. Job berat tidak merebut koneksi milik HTTP.
-- **Job periodik** (sinkron FEDERATED, hapus session kedaluwarsa) lewat `worker.Every(kind, interval)`, dengan resolusi 1 menit. Aman dijalankan multi-instance karena `unique_key` per slot waktu, sehingga hanya satu instance yang berhasil `INSERT IGNORE`. Tidak perlu cron terpisah atau `GET_LOCK`.
+- **Job periodik** (sinkron FEDERATED, hapus session kedaluwarsa) lewat `worker.Every(kind, interval)`, dengan resolusi 1 menit. Aman dijalankan multi-instance karena `unique_key` per slot waktu, sehingga hanya satu instance yang berhasil `INSERT IGNORE`. Tidak perlu cron terpisah atau `GET_LOCK`. Slot dihitung dari jam proses, jadi jam semua instance worker wajib sinkron (NTP) dan handler periodik tetap harus idempoten.
 - **Latensi & kapasitas**: saat antrean kosong, job baru diambil paling lambat `PollInterval` (mis. 1 detik); kalau butuh respons instan, kerjakan di request. Saat antrean penuh, slot yang selesai langsung diisi lagi tanpa menunggu poll. Polling `SKIP LOCKED` memakai index `(status, run_at)` dan tidak memblokir `INSERT` job baru (sudah diuji). Ini nyaman untuk ratusan sampai ribuan job per menit. Kalau jauh di atas itu, lihat §14.
 - **Tabel `jobs` hanya diubah lewat PK** (§6.4). Reclaim dan penghapusan job lama memakai pola "SELECT id → UPDATE/DELETE by id". Penghapusan dijalankan per 1000 ID oleh satu job periodik, bukan oleh setiap instance tiap menit. Tanpa pola ini, `MarkJobDone` deadlock dengan reclaim/cleanup, status gagal tersimpan, dan job dijalankan dua kali setelah `LockFor` (sudah terbukti di uji).
 - **Status job yang gagal disimpan karena deadlock di-retry** (maks 3 kali). Claim yang bentrok cukup diulang, karena transaksinya sudah rollback dan job tetap `pending`.
+- **Status hanya disimpan oleh pemegang klaim**: `MarkJobDone`/`MarkJobFailed`/`RetryJob` memakai `WHERE id = ? AND attempts = <attempts saat klaim>`. Setiap klaim menaikkan `attempts`, jadi kalau job sudah diklaim ulang worker lain, hasil worker yang terlambat (handler melewati `LockFor`) mendapat 0 baris dan tidak mengembalikan job yang sedang jalan ke `pending`. Kalau job baru di-reclaim tapi belum diklaim ulang, hasil yang terlambat tetap tersimpan, sehingga job yang sudah sukses tidak dijalankan lagi.
 
 ### 7.3 Polling status job dari HTMX
 
@@ -421,9 +423,11 @@ Kode untuk §8.1–8.4 dan §8.6 ada di [references/auth-dan-keamanan.md](refere
 
 Tidak butuh Redis: cukup tabel `login_failures` + `COUNT` ber-index dalam jendela geser 15 menit.
 
-- Ada dua kunci: **per username** (5 kali gagal) dan **per IP** (30 kali gagal, sengaja longgar karena satu klinik bisa keluar lewat satu IP NAT). Kalau salah satunya terlewati, balas 429 **tanpa** menjalankan bcrypt.
-- Login sukses menghapus kegagalan milik username saja, bukan milik IP. Kalau ikut dihapus, penyerang yang punya satu akun valid bisa me-reset batas IP-nya.
-- Orang lain bisa memakai blokir per username untuk mengunci akun target selama 15 menit. Ini trade-off yang diterima. Jangan ubah menjadi kunci permanen yang hanya bisa dibuka admin.
+- Ada dua kunci: **per akun** (5 kali gagal) dan **per IP** (30 kali gagal, sengaja longgar karena satu klinik bisa keluar lewat satu IP NAT; IPv6 dihitung per /64). Kalau salah satunya terlewati, balas 429 **tanpa** menjalankan bcrypt.
+- Kunci akun = **bentuk kanonik username menurut collation** (`WEIGHT_STRING`, dihitung MariaDB), bukan teks yang diketik. Collation username mengabaikan huruf besar/kecil dan aksen, jadi `budi` dan `búdi` login ke akun yang sama; kalau kuncinya teks, setiap varian mendapat jatah 5 percobaan sendiri. Username tak terdaftar diperlakukan sama, sehingga perilaku blokir tidak membocorkan username mana yang terdaftar (kunci ID user justru membocorkannya: varian username tak terdaftar tetap lolos, varian username terdaftar diblokir).
+- **Catat dulu, baru hitung**, sebelum bcrypt. Kalau dihitung dulu lalu dicatat setelah bcrypt, ratusan request paralel lolos pengecekan bersamaan selagi hitungannya masih 0. Percobaan yang diblokir menghapus catatannya lagi, supaya penyerang yang terus mencoba tidak mengunci akun tanpa batas.
+- Login sukses menghapus kegagalan milik akun saja, bukan milik IP. Kalau ikut dihapus, penyerang yang punya satu akun valid bisa me-reset batas IP-nya.
+- Orang lain bisa memakai blokir per akun untuk mengunci akun target selama 15 menit. Ini trade-off yang diterima. Jangan ubah menjadi kunci permanen yang hanya bisa dibuka admin.
 - IP klien hanya diambil dari `middleware.ClientIP(ctx)` (§8.6). Tanpa pembacaan `X-Forwarded-For` yang benar, semua user terlihat ber-IP proxy sehingga batas per IP mengunci semua orang, atau penyerang memalsukan header untuk lolos dari batas.
 - Kegagalan lama dihapus job periodik (`jobs.KindLoginFailureCleanup`).
 
@@ -450,7 +454,8 @@ Untuk data sensitif (rekam medis, data pribadi, keuangan), audit log adalah **da
 
 - **Token hanya di cookie, DB hanya menyimpan hash-nya.** Kalau tabel `sessions` bocor, isinya tidak bisa dipakai untuk login.
 - **Rotasi session saat login** (hapus baris lama) untuk mencegah session fixation, dan hapus baris saat logout. "Logout semua perangkat" cukup `DELETE ... WHERE user_id = ?`.
-- **1 lookup PK per request, tanpa UPDATE per request.** Expiry diperpanjang paling sering tiap 5 menit (cek `idle_seconds` dari query), supaya tidak ada write ke DB di setiap klik. Session kedaluwarsa dihapus oleh job periodik.
+- **1 lookup PK per request, tanpa UPDATE per request.** Expiry diperpanjang paling sering tiap 5 menit (cek `idle_seconds` dari query), supaya tidak ada write ke DB di setiap klik. Session kedaluwarsa dihapus oleh job periodik (lewat PK, §6.4).
+- **Dua batas waktu**: idle (`SESSION_TTL`, mis. 30 menit tanpa aktivitas) dan mutlak (`SESSION_MAX_AGE`, mis. 12 jam sejak login). Perpanjangan idle tidak pernah melewati batas mutlak, jadi user yang terus aktif tetap wajib login ulang. `config.Load` memvalidasi `SESSION_TTL ≤ SESSION_MAX_AGE`.
 - **Cookie session tanpa `MaxAge`/`Expires`.** Masa berlaku hanya ditentukan `expires_at` di DB. Kalau cookie diberi `MaxAge=TTL`, cookie habis pada `login + TTL` walaupun session di DB sudah diperpanjang, sehingga user yang aktif tetap ter-logout.
 - **CSRF**: bungkus mux dengan `http.CrossOriginProtection` (Go 1.25). Request browser lintas origin yang bukan GET/HEAD/OPTIONS ditolak, sedangkan client non-browser (bearer M2M) tidak terpengaruh. Untuk browser yang tidak mengirim `Sec-Fetch-Site`, pengecekan beralih ke `Origin` vs `Host`, jadi reverse proxy wajib meneruskan `Host` asli (`proxy_set_header Host $host;`) atau origin publik didaftarkan lewat `AddTrustedOrigin`. Kalau tidak, POST yang sah ditolak 403.
 - Bedakan "belum login" dari "DB bermasalah": `sql.ErrNoRows` → `session.ErrNoSession` → redirect login, error lain → 500. Jangan semua error diarahkan ke login.
@@ -458,6 +463,7 @@ Untuk data sensitif (rekam medis, data pribadi, keuangan), audit log adalah **da
 - **User nonaktif langsung kehilangan session**, karena `GetSession` join ke `users ... is_active`. Setelah ganti password atau menonaktifkan user, panggil `DeleteUserSessions` supaya semua perangkat ter-logout.
 - Di HTTPS, nama cookie memakai prefix `__Host-` (`__Host-session_id`). Browser menolak cookie ber-prefix ini kalau tanpa `Secure` atau kalau memakai `Domain`, sehingga subdomain lain tidak bisa menimpanya.
 - Respons ber-session diberi `Cache-Control: no-store` oleh `Require`, supaya data tidak tersimpan di cache browser atau proxy (misalnya tombol Back setelah logout di komputer loket bersama).
+- `no-store` **tidak** berlaku untuk cache riwayat htmx, yang menyimpan snapshot HTML halaman di `sessionStorage` (htmx ≤ 2.0.4: `localStorage`). Snapshot itu tetap ada setelah logout sampai tab ditutup, jadi tombol Back di komputer loket bersama masih menampilkan data. Karena itu `historyCacheSize:0` di `htmx-config` (§5 butir 8). Tombol Back lalu meminta halaman ke server (`HX-History-Restore-Request`), dan `isFragment` membalasnya dengan halaman penuh.
 
 ### 8.6 Header keamanan & IP klien
 
@@ -468,7 +474,7 @@ Untuk data sensitif (rekam medis, data pribadi, keuangan), audit log adalah **da
 ### 8.7 Config & secret
 
 - Konfigurasi deployment dari environment variable (DB DSN, `SECRET_KEY`, pool size, timeout, cookie setting, retensi, bootstrap admin sekali pakai). Divalidasi di startup; kalau tidak valid, proses langsung exit (fail fast).
-- Wajib ada: `APP_TZ` (§6.1), `TRUSTED_PROXIES` (CIDR reverse proxy sendiri; kosong = tidak ada proxy), dan `COOKIE_SECURE`. Kalau `APP_ENV=production`, `config.Load` menolak start bila `COOKIE_SECURE` bukan `true`.
+- Wajib ada: `APP_TZ` (§6.1), `TRUSTED_PROXIES` (CIDR reverse proxy sendiri; kosong = tidak ada proxy), `SESSION_TTL` & `SESSION_MAX_AGE` (§8.5), dan `COOKIE_SECURE`. Kalau `APP_ENV=production`, `config.Load` menolak start bila `COOKIE_SECURE` bukan `true`.
 - **Kredensial BPJS operasional tidak disimpan di `.env`**, tapi terenkripsi per environment di MariaDB (AES-GCM, `crypto/cipher`). `SECRET_KEY` untuk enkripsi/dekripsinya hanya ada di environment.
 
 ## 9. Integrasi HTTP Pihak Ketiga
@@ -605,10 +611,11 @@ mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 - [ ] Tidak ada HTTP call, email, atau sleep di dalam `InTx`; tidak ada pemakaian `s.db`/`s.q` di dalam `InTx`; waktu expiry/`run_at`/lock dihitung dengan `NOW()` di SQL
 - [ ] Tidak ada query di dalam loop (N+1); query baru sudah dicek `EXPLAIN`
 - [ ] Tidak ada `go func()` mentah di handler/service/task; semua lewat `background.Runner` (goroutine bootstrap di `main.go` dikecualikan)
-- [ ] `jobs.Enqueue` dipanggil di dalam `InTx` yang sama dengan data bisnisnya; handler job idempoten dan menghormati `ctx`
+- [ ] `jobs.Enqueue` dipanggil di dalam `InTx` yang sama dengan data bisnisnya; handler job idempoten dan menghormati `ctx`; update status job memakai `id` + `attempts` klaim
 - [ ] Worker di proses terpisah dengan `MaxOpen ≥ Concurrency + 2`; `pending`/`oldest_seconds`/`failed` dipantau
 - [ ] `UPDATE`/`DELETE` massal di tabel ramai memakai pola "SELECT id → ubah by PK", bertahap (`LIMIT` + loop); deadlock 1213/1205 di-retry dengan mengulang seluruh transaksi
-- [ ] Tidak ada sintaks khusus MariaDB yang tidak dikenali sqlc di `queries/*.sql`; batas waktu query lewat `max_statement_time` di DSN
+- [ ] Tidak ada sintaks khusus MariaDB yang tidak dikenali sqlc di `queries/*.sql`; batas waktu query lewat `max_statement_time` yang di-set `database.Open`
+- [ ] Setiap `CREATE TABLE` menulis `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=...` secara eksplisit
 - [ ] `*http.Client` per integrasi dengan `Timeout` & `MaxIdleConnsPerHost`; `resp.Body` selalu ditutup
 - [ ] `http.MaxBytesReader` dipasang sebelum parse body
 - [ ] Polling HTMX berhenti (286) di semua kondisi akhir, termasuk not found
@@ -627,9 +634,9 @@ mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 - [ ] Tidak ada Redis/broker tambahan tanpa sinyal dari §14 dan catatan di `docs/decisions/`
 - [ ] Tidak ada import cycle / `repository.go` pass-through / interface tanpa implementasi kedua
 - [ ] `http.CrossOriginProtection` aktif dan proxy meneruskan `Host`; session ID dirotasi saat login; HTMX unauth memakai `HX-Redirect`
-- [ ] Token session & client proxy disimpan sebagai hash; session = 1 lookup PK tanpa UPDATE per request; cookie session tanpa `MaxAge`; kredensial BPJS terenkripsi di DB, bukan di `.env`
+- [ ] Token session & client proxy disimpan sebagai hash; session = 1 lookup PK tanpa UPDATE per request; batas idle + batas mutlak; cookie session tanpa `MaxAge`; `htmx-config` dengan `historyCacheSize:0`; kredensial BPJS terenkripsi di DB, bukan di `.env`
 - [ ] Password bcrypt lewat `auth.Hasher` (paralel dibatasi), panjang 15–72 byte; username tak dikenal mendapat pesan & waktu respons yang sama
-- [ ] Batas percobaan login per username & per IP aktif; IP klien hanya dari `middleware.ClientIP` (`X-Forwarded-For` hanya dari `TRUSTED_PROXIES`)
+- [ ] Batas percobaan login per akun (kunci kanonik menurut collation) & per IP (IPv6 per /64) aktif, dicatat sebelum bcrypt; IP klien hanya dari `middleware.ClientIP` (`X-Forwarded-For` hanya dari `TRUSTED_PROXIES`)
 - [ ] Setiap route ber-login memakai `a.Perm(...)` atau `a.Require` dengan sengaja; data dibatasi di query sesuai user/unit, bukan dari parameter request
 - [ ] Mutasi & akses baca data sensitif diaudit sinkron (`audit.Write`; di `InTx` untuk mutasi); `detail` tanpa isi data medis/password
 - [ ] Ganti password / nonaktifkan user → `DeleteUserSessions`

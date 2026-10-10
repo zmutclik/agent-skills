@@ -25,7 +25,7 @@ CREATE TABLE jobs (
   UNIQUE KEY uq_jobs_unique_key (unique_key),
   KEY idx_jobs_status_run_at (status, run_at),
   KEY idx_jobs_status_updated (status, updated_at)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE sessions (
   id_hash      BINARY(32)   PRIMARY KEY, -- SHA-256 token cookie; token asli tidak disimpan
@@ -35,7 +35,7 @@ CREATE TABLE sessions (
   created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_sessions_user (user_id),
   KEY idx_sessions_expires (expires_at)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- +goose Down
 DROP TABLE sessions;
@@ -73,17 +73,23 @@ SET status = 'running', attempts = attempts + 1,
     locked_until = DATE_ADD(NOW(), INTERVAL CAST(sqlc.arg(lock_seconds) AS SIGNED) SECOND)
 WHERE id IN (sqlc.slice('ids'));
 
--- name: MarkJobDone :exec
-UPDATE jobs SET status = 'done', locked_until = NULL, last_error = NULL WHERE id = ?;
+-- name: MarkJobDone :execrows
+-- attempts = token klaim: setiap klaim menaikkan attempts. Kalau job sudah diklaim ulang
+-- worker lain, hasil worker yang terlambat mendapat 0 baris dan tidak menimpa status job
+-- yang sedang jalan. Kalau job baru di-reclaim (belum diklaim ulang), hasilnya tetap
+-- tersimpan, jadi job yang sudah sukses tidak dijalankan lagi.
+UPDATE jobs SET status = 'done', locked_until = NULL, last_error = NULL
+WHERE id = ? AND attempts = ?;
 
--- name: MarkJobFailed :exec
-UPDATE jobs SET status = 'failed', locked_until = NULL, last_error = ? WHERE id = ?;
+-- name: MarkJobFailed :execrows
+UPDATE jobs SET status = 'failed', locked_until = NULL, last_error = ?
+WHERE id = ? AND attempts = ?;
 
--- name: RetryJob :exec
+-- name: RetryJob :execrows
 UPDATE jobs
 SET status = 'pending', locked_until = NULL, last_error = sqlc.arg(last_error),
     run_at = DATE_ADD(NOW(), INTERVAL CAST(sqlc.arg(delay_seconds) AS SIGNED) SECOND)
-WHERE id = sqlc.arg(id);
+WHERE id = sqlc.arg(id) AND attempts = sqlc.arg(attempts);
 
 -- name: ListStaleJobIDs :many
 SELECT id FROM jobs WHERE status = 'running' AND locked_until < NOW() LIMIT 1000;
@@ -126,9 +132,16 @@ JOIN users u ON u.id = s.user_id
 WHERE s.id_hash = ? AND s.expires_at > NOW() AND u.is_active = TRUE;
 
 -- name: TouchSession :exec
+-- Perpanjangan idle tidak pernah melewati batas mutlak created_at + max_age:
+-- user yang terus aktif tetap wajib login ulang (mis. tiap 12 jam).
+-- expires_at > NOW(): session yang sudah kedaluwarsa tidak pernah dihidupkan lagi
+-- (DeleteExpiredSessions bergantung pada ini).
 UPDATE sessions
-SET last_seen_at = NOW(), expires_at = DATE_ADD(NOW(), INTERVAL CAST(sqlc.arg(ttl_seconds) AS SIGNED) SECOND)
-WHERE id_hash = sqlc.arg(id_hash);
+SET last_seen_at = NOW(),
+    expires_at = LEAST(
+      DATE_ADD(NOW(), INTERVAL CAST(sqlc.arg(ttl_seconds) AS SIGNED) SECOND),
+      DATE_ADD(created_at, INTERVAL CAST(sqlc.arg(max_age_seconds) AS SIGNED) SECOND))
+WHERE id_hash = sqlc.arg(id_hash) AND expires_at > NOW();
 
 -- name: DeleteSession :exec
 DELETE FROM sessions WHERE id_hash = ?;
@@ -136,8 +149,16 @@ DELETE FROM sessions WHERE id_hash = ?;
 -- name: DeleteUserSessions :exec
 DELETE FROM sessions WHERE user_id = ?;
 
+-- name: ListExpiredSessionIDs :many
+-- Cleanup lewat PK (SKILL §6.4): DELETE by range di idx_sessions_expires mengunci juga
+-- session AKTIF pertama sesudah range, sehingga TouchSession user itu menunggu/deadlock.
+SELECT id_hash FROM sessions WHERE expires_at < NOW() LIMIT 1000;
+
 -- name: DeleteExpiredSessions :execrows
-DELETE FROM sessions WHERE expires_at < NOW() LIMIT 1000;
+-- Sengaja TANPA "AND expires_at < NOW()": dengan kondisi itu optimizer kadang memilih
+-- idx_sessions_expires (range) lagi, bukan PK (terlihat di EXPLAIN). Aman, karena session
+-- kedaluwarsa tidak pernah diperpanjang (TouchSession mensyaratkan expires_at > NOW()).
+DELETE FROM sessions WHERE id_hash IN (sqlc.slice('ids'));
 ```
 
 Semua waktu dihitung dengan `NOW()` milik DB (SKILL §6.3); pola `CAST(sqlc.arg(x) AS SIGNED)` dijelaskan di struktur-project §6.
@@ -336,31 +357,42 @@ func (w *Worker) run(j store.PickJobsRow) {
 	// context baru: ctx job bisa sudah habis, tapi hasilnya tetap harus tercatat
 	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var save func() error
+	// Semua query status memakai id + attempts klaim ini: kalau job sudah diklaim ulang
+	// worker lain, update-nya 0 baris dan tidak menimpa status job yang sedang jalan.
+	claimed := int32(attempt)
+	var save func() (int64, error)
 	switch {
 	case err == nil:
-		save = func() error { return w.q.MarkJobDone(ctx, j.ID) }
+		p := store.MarkJobDoneParams{ID: j.ID, Attempts: claimed}
+		save = func() (int64, error) { return w.q.MarkJobDone(ctx, p) }
 	case errors.Is(err, ErrPermanent) || attempt >= w.cfg.MaxAttempts:
 		log.Error("job gagal permanen", "err", err)
-		p := store.MarkJobFailedParams{ID: j.ID, LastError: sql.NullString{String: err.Error(), Valid: true}}
-		save = func() error { return w.q.MarkJobFailed(ctx, p) }
+		p := store.MarkJobFailedParams{ID: j.ID, Attempts: claimed,
+			LastError: sql.NullString{String: err.Error(), Valid: true}}
+		save = func() (int64, error) { return w.q.MarkJobFailed(ctx, p) }
 	default:
 		log.Warn("job gagal, dijadwalkan ulang", "err", err)
-		p := store.RetryJobParams{ID: j.ID, DelaySeconds: 10 << min(attempt, 10), // 20s, 40s, ... maks ~3 jam
-			LastError: sql.NullString{String: err.Error(), Valid: true}}
-		save = func() error { return w.q.RetryJob(ctx, p) }
+		p := store.RetryJobParams{ID: j.ID, Attempts: claimed,
+			DelaySeconds: 10 << min(attempt, 10), // 20s, 40s, ... maks ~3 jam
+			LastError:    sql.NullString{String: err.Error(), Valid: true}}
+		save = func() (int64, error) { return w.q.RetryJob(ctx, p) }
 	}
 	// Status gagal tersimpan = job di-reclaim setelah LockFor dan jalan dua kali.
 	// Deadlock/lock wait boleh di-retry (SKILL §6.4); update status idempoten.
+	var n int64
 	for try := 1; ; try++ {
-		err = save()
+		n, err = save()
 		if err == nil || try == 3 || !database.IsRetryable(err) {
 			break
 		}
 		log.Warn("simpan status job di-retry", "try", try, "err", err)
 	}
-	if err != nil {
+	switch {
+	case err != nil:
 		log.Error("status job gagal disimpan, akan di-reclaim setelah LockFor", "err", err)
+	case n == 0:
+		// handler berjalan melewati LockFor (mengabaikan ctx?): job sudah diklaim ulang
+		log.Warn("status job tidak disimpan: job sudah diklaim ulang worker lain")
 	}
 }
 
@@ -385,6 +417,9 @@ func (w *Worker) maintain(ctx context.Context) {
 	} else if n > 0 {
 		w.log.Warn("job macet dikembalikan ke antrean", "count", n)
 	}
+	// Slot dihitung dari jam proses, jadi jam semua instance worker wajib sinkron (NTP).
+	// Selisih jam di batas slot bisa menjadwalkan satu job periodik dua kali; karena itu
+	// handler periodik juga harus idempoten (semua cleanup di sini idempoten).
 	now := time.Now()
 	for kind, every := range w.periodic {
 		key := fmt.Sprintf("%s:%d", kind, now.Truncate(every).Unix())
@@ -563,7 +598,7 @@ func run() error {
 	ordersSvc := &orders.Service{}                          // orders.NewService(db, q, ...) di project nyata
 	w.Handle(jobs.KindOrderSync, ordersSvc.HandleOrderSync) // satu baris per kind
 
-	sessions := session.NewStore(q, cfg.SessionTTL, cfg.CookieSecure)
+	sessions := session.NewStore(q, cfg.SessionTTL, cfg.SessionMaxAge, cfg.CookieSecure)
 	w.Handle(jobs.KindSessionCleanup, sessions.HandleCleanup)
 	w.Every(jobs.KindSessionCleanup, time.Hour)
 
@@ -660,19 +695,21 @@ type User struct {
 
 type Store struct {
 	q      *store.Queries
-	ttl    time.Duration
+	ttl    time.Duration // idle: session habis kalau tidak dipakai selama ini
+	maxAge time.Duration // mutlak: session habis sejak login, walau terus dipakai
 	secure bool
 	cookie string
 }
 
-func NewStore(q *store.Queries, ttl time.Duration, secure bool) *Store {
+// NewStore: ttl ≤ maxAge, divalidasi config.Load (mis. SESSION_TTL=30m, SESSION_MAX_AGE=12h).
+func NewStore(q *store.Queries, ttl, maxAge time.Duration, secure bool) *Store {
 	// Prefix __Host- membuat browser menolak cookie ini kalau tanpa Secure, dengan Domain,
 	// atau Path selain "/", sehingga subdomain lain tidak bisa menimpanya. Hanya bisa di HTTPS.
 	name := "session_id"
 	if secure {
 		name = "__Host-session_id"
 	}
-	return &Store{q: q, ttl: ttl, secure: secure, cookie: name}
+	return &Store{q: q, ttl: ttl, maxAge: maxAge, secure: secure, cookie: name}
 }
 
 // hash: DB hanya menyimpan SHA-256 token, jadi bocornya tabel sessions tidak bisa dipakai login.
@@ -716,8 +753,8 @@ func (s *Store) User(r *http.Request) (User, error) {
 		return User{}, err // DB bermasalah: bukan alasan untuk redirect ke login
 	}
 	if row.IdleSeconds > 300 {
-		if err := s.q.TouchSession(r.Context(), store.TouchSessionParams{
-			IDHash: id, TtlSeconds: int64(s.ttl / time.Second)}); err != nil {
+		if err := s.q.TouchSession(r.Context(), store.TouchSessionParams{IDHash: id,
+			TtlSeconds: int64(s.ttl / time.Second), MaxAgeSeconds: int64(s.maxAge / time.Second)}); err != nil {
 			return User{}, err
 		}
 	}
@@ -736,11 +773,18 @@ func (s *Store) Logout(ctx context.Context, w http.ResponseWriter, r *http.Reque
 }
 
 // HandleCleanup dipasang di worker: w.Every(jobs.KindSessionCleanup, time.Hour).
+// Pola SELECT id → DELETE by PK per 1000 (SKILL §6.4), supaya tidak deadlock dengan TouchSession.
 func (s *Store) HandleCleanup(ctx context.Context, _ json.RawMessage) error {
 	for {
-		n, err := s.q.DeleteExpiredSessions(ctx)
-		if err != nil || n < 1000 {
+		ids, err := s.q.ListExpiredSessionIDs(ctx)
+		if err != nil || len(ids) == 0 {
 			return err
+		}
+		if _, err := s.q.DeleteExpiredSessions(ctx, ids); err != nil {
+			return err
+		}
+		if len(ids) < 1000 {
+			return nil
 		}
 	}
 }
@@ -876,5 +920,19 @@ Lima baris terakhir berasal dari pengujian versi awal.
 | Session setelah logout | tidak berlaku lagi |
 | Cookie di HTTPS / HTTP | `__Host-session_id` / `session_id`, tanpa `MaxAge` |
 | `Require` | menambah `Cache-Control: no-store` |
+
+**Revisi review 2026-10-10** (status job per klaim, batas mutlak session, cleanup session lewat PK, collation eksplisit). Kode diekstrak langsung dari dokumen ini, `sqlc diff` bersih, lolos `go vet` + `gofmt`, dan diuji `go test -race` dengan Go 1.27.2, sqlc v1.30.0, dan MariaDB 10.11.13:
+
+| Skenario | Hasil |
+|---|---|
+| Worker A klaim job, job di-reclaim lalu diklaim worker B, kemudian hasil A datang (gagal → retry / sukses) | update A = 0 baris, job tetap `running` milik B (`attempts=2`); hasil B tersimpan (`pending` / `done`) |
+| Job di-reclaim (belum diklaim ulang), lalu hasil sukses worker A datang | `done`; job tidak dijalankan lagi |
+| `EXPLAIN` `ReclaimJobs` (20.000 `done`, 500 `pending`, 3–200 `running` yang semuanya stale) dan `DeleteJobs` (1.000 ID) | selalu `key=PRIMARY` |
+| Session login 11j55m lalu, aktif terus (`TTL=30m`, `MAX_AGE=12h`) | `expires_at` diperpanjang hanya sampai ±5 menit lagi (batas mutlak) |
+| Session login 1 jam lalu, idle 10 menit | `expires_at` diperpanjang 30 menit |
+| Session lewat batas mutlak | `ErrNoSession` |
+| Cleanup 2.500 session kedaluwarsa + 3 aktif | 2.500 terhapus dalam beberapa batch, 3 tersisa |
+| Transaksi cleanup ditahan terbuka (5.000 session aktif, 50 kedaluwarsa), lalu `TouchSession` session aktif terdekat | versi lama (`DELETE ... WHERE expires_at < NOW()`): **terblokir 2 detik → 1205**; versi baru (SELECT id → DELETE by PK): ±1 ms |
+| `EXPLAIN` DELETE by PK **dengan** kondisi `expires_at < NOW()` diulang | rencana tidak stabil: kadang `PRIMARY`, kadang `idx_sessions_expires` (range). Karena itu `DeleteExpiredSessions` tanpa kondisi tersebut |
 
 Rincian uji login, izin, dan audit ada di [auth-dan-keamanan §10](auth-dan-keamanan.md). `background.Runner` masih hanya diperiksa dengan `go vet`, belum punya test.

@@ -249,7 +249,7 @@ Konvensi isi file:
   <meta charset="utf-8">
   <title>{{block "title" .}}App{{end}}</title>
   <!-- syarat lolos CSP (SKILL §5 butir 8) -->
-  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false}'>
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"historyCacheSize":0}'>
   <link rel="stylesheet" href="/static/css/app.css?v={{version}}">
   <script src="/static/js/htmx.min.js?v={{version}}" defer></script>
   <script src="/static/js/app.js?v={{version}}" defer></script>
@@ -332,7 +332,7 @@ func run() error {
 	}
 
 	q := store.New(db)
-	sessions := session.NewStore(q, cfg.SessionTTL, cfg.CookieSecure)
+	sessions := session.NewStore(q, cfg.SessionTTL, cfg.SessionMaxAge, cfg.CookieSecure)
 	auth := middleware.NewAuth(sessions, log)
 
 	mux := http.NewServeMux()
@@ -423,9 +423,11 @@ sql:
 - Satu sumber schema: **folder `migrations/`**. Tidak ada `schema.sql` terpisah yang bisa beda isinya dengan migrasi.
 - Nama query sqlc per domain diberi prefix entitas: `ListItems`, `GetItem`, `CreateOrder`. Ini mencegah tabrakan karena semuanya di-generate ke satu package `store`.
 - Migrasi: `goose -dir migrations create add_items sql`. Satu perubahan schema per file, dan jangan edit file yang sudah di-deploy.
+- Setiap `CREATE TABLE` diakhiri `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci` (atau collation yang sudah diputuskan di `docs/decisions/`). Tanpa itu, tabel mengikuti default server, yang di instalasi MariaDB bawaan masih `latin1`.
 - Query sqlc yang dipakai: `:one`, `:many`, `:exec`, `:execrows`, `:execlastid` (insert yang butuh ID), dan `sqlc.slice('ids')` untuk `IN (...)`.
+- sqlc v1.30 (dialek MySQL) **diam-diam membuang parameter** yang ditulis di dalam `COLLATE` atau `CONVERT(... USING ...)`: fungsi Go-nya tidak punya argumen, sementara SQL-nya masih berisi `?`/`sqlc.arg`. Taruh parameter di tabel turunan (`FROM (SELECT CAST(sqlc.arg(x) AS CHAR) AS x) AS i`) lalu terapkan `COLLATE` pada kolomnya; contohnya `LoginThrottleKey` di [auth-dan-keamanan §2](auth-dan-keamanan.md). Selalu periksa signature hasil generate untuk query yang memakai fungsi khusus.
 - Durasi relatif terhadap `NOW()` (SKILL §6.3) ditulis `DATE_ADD(NOW(), INTERVAL CAST(sqlc.arg(x) AS SIGNED) SECOND)`. `CAST` membuat sqlc men-generate parameter `int64`, bukan `interface{}`.
-- Parser sqlc (dialek MySQL) tidak mengenali sebagian sintaks khusus MariaDB (contoh terverifikasi: `SET STATEMENT ... FOR`). Kalau `sqlc generate` gagal karena itu, ubah pendekatannya (batas waktu query cukup lewat `max_statement_time` di DSN, SKILL §6.3), jangan menulis query manual di luar `store`.
+- Parser sqlc (dialek MySQL) tidak mengenali sebagian sintaks khusus MariaDB (contoh terverifikasi: `SET STATEMENT ... FOR`). Kalau `sqlc generate` gagal karena itu, ubah pendekatannya (batas waktu query cukup lewat `max_statement_time` yang di-set `database.Open`, SKILL §6.3), jangan menulis query manual di luar `store`.
 - Setelah mengubah SQL: `sqlc generate`. CI menjalankan `sqlc diff` (atau `sqlc vet`) supaya kode generate tidak tertinggal.
 
 ## 7. Konvensi Penamaan
