@@ -18,16 +18,16 @@ Jaminan terpenting arsitektur ini hanya bisa dibuktikan di MariaDB: `max_stateme
 | `httpx.AsyncClient(transport=ASGITransport(app))` | Request melewati middleware, dependency, dan error handler asli. |
 | Helper `login()` lewat form asli | Ikut menguji double-submit CSRF dan pembuatan session. |
 
-CI: `template/.github/workflows/ci.yml` menjalankan lint, test di MariaDB 11.4 (utf8mb4, UTC), dan build image pada setiap push/PR.
+CI: `template/.github/workflows/ci.yml` menjalankan lint, test di MariaDB 11.4 (utf8mb4, UTC), `pip-audit` atas `uv.lock`, dan build image pada setiap push/PR, plus audit mingguan. Action di-pin ke commit SHA; Dependabot memperbarui dependency, base image, dan action.
 
 ## 3. Yang wajib diuji (inti)
 
 | Area | Test |
 |---|---|
 | HTMX | Full page vs fragment (row hasil create memuat `created_at` tanpa lazy load), `Vary`, history restore, script Alpine hanya di halaman pemakainya, 422 + `HX-Retarget`, `HX-Trigger`, 401 → `HX-Redirect`, error → toast, query tidak valid → toast (bukan JSON mentah; `/api/` tetap JSON) |
-| Auth | Session disimpan sebagai hash, CSRF wajib, rate limit login (termasuk 15 percobaan paralel: ≤ `LOGIN_MAX_FAILURES` yang diverifikasi; lockout per (username, IP) tidak mengunci pemilik akun di IP lain; batas per IP lintas username), throttle `last_seen_at`, perpanjangan session tidak melewati `SESSION_MAX_AGE` dan `max_age` cookie = `SESSION_MAX_AGE`, perubahan role mencabut session, argon2 paralel ≤ `PASSWORD_HASH_CONCURRENCY`, cleanup menghapus session kedaluwarsa & catatan login lama, username terlalu panjang → 400 (bukan 500), ganti password mencabut session, CLI membuat admin & reset password. Test auth memakai route khusus test (`/__whoami`), tidak bergantung pada domain `items`. |
+| Auth | Session disimpan sebagai hash, CSRF wajib, rate limit login (termasuk 15 percobaan paralel: ≤ `LOGIN_MAX_FAILURES` yang diverifikasi; lockout per (user, IP) tidak mengunci pemilik akun di IP lain; batas per IP lintas username; varian huruf username = satu user; berganti alamat IPv6 dalam satu /64 tidak menembus lockout; teks username tidak tersimpan), kebijakan password & role ditegakkan di service, `change_role` user tak ada → `False`, CLI menolak role tak dikenal, throttle `last_seen_at`, perpanjangan session tidak melewati `SESSION_MAX_AGE` dan `max_age` cookie = `SESSION_MAX_AGE`, perubahan role mencabut session, argon2 paralel ≤ `PASSWORD_HASH_CONCURRENCY`, cleanup menghapus session kedaluwarsa & catatan login lama, username terlalu panjang → 400 (bukan 500), ganti password mencabut session, CLI membuat admin & reset password. Test auth memakai route khusus test (`/__whoami`), tidak bergantung pada domain `items`. |
 | Otorisasi | Endpoint admin menolak role biasa (403); user hanya melihat item miliknya, admin melihat semua |
-| Platform | Security headers, request ID, exception tak tertangani → 500 tetap membawa CSP + `X-Request-ID` dan log-nya ber-`request_id` (browser & HTMX), `SECRET_KEY` < 32 karakter ditolak, `time_zone=+00:00`, `max_statement_time` menghentikan query lambat, migrasi mencatat versi di `alembic_version` (tanpa itu deploy berikutnya gagal "Table already exists"), health check, `/readyz` tetap 200 saat pool web penuh, `/readyz` paralel hanya memicu satu probe DB, database `utf8mb4` menyimpan emoji, `Cache-Control: no-store` default (tidak menimpa header endpoint), `static_url` ber-hash, filter `localtime`, satu log JSON `request` per request (tanpa health check), log uvicorn lewat handler JSON |
+| Platform | Security headers, request ID (format tidak wajar diganti), exception tak tertangani → 500 tetap membawa CSP + `X-Request-ID` dan log-nya ber-`request_id` (browser & HTMX), `SECRET_KEY` < 32 karakter ditolak, `time_zone=+00:00`, `max_statement_time` menghentikan query lambat, migrasi mencatat versi di `alembic_version` (tanpa itu deploy berikutnya gagal "Table already exists"), health check, `/readyz` tetap 200 saat pool web penuh, `/readyz` paralel hanya memicu satu probe DB, database `utf8mb4` menyimpan emoji, `Cache-Control: no-store` default (tidak menimpa header endpoint), `static_url` ber-hash, filter `localtime`, satu log JSON `request` per request (tanpa health check), log uvicorn lewat handler JSON |
 
 Addon: `jobs.md` §6 dan `auth.md` §6.
 
@@ -56,5 +56,6 @@ Sebelum rilis besar, jalankan migrasi lalu `docker compose up -d --build` (`temp
 - `/login` → login → `POST /items` dengan `HX-Request`: response membawa `HX-Trigger`;
 - POST `/login` beruntun: nginx membalas 429;
 - POST `/login` gagal dengan header `X-Forwarded-For: 203.0.113.9`: kolom `login_failures.ip` berisi IP asli client, **bukan** `203.0.113.9`;
+- request dengan header `X-Request-ID: palsu`: header `X-Request-ID` di response adalah ID buatan nginx (32 hex), bukan `palsu`;
 - DB tidak terjangkau (mis. blokir akses ke host DB): `/readyz` 503, `/healthz` tetap 200;
 - addon jobs: job diproses worker, dan `request_id` dari request web muncul di log worker.

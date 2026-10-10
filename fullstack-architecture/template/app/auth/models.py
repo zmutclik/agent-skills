@@ -6,6 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 
 USERNAME_MAX_LENGTH = 100
+ROLES = ("user", "admin")   # require_role(...) dan CLI hanya mengenal nilai ini; tambah role baru di sini
 
 
 class User(Base):
@@ -33,7 +34,9 @@ class UserSession(Base):
 
 class LoginFailure(Base):
     """Rate limit login tanpa Redis: setiap percobaan dicatat di sini dulu dan baru dihapus bila login
-    berhasil; kegagalan dihitung per (username, IP) dan per IP dalam jendela waktu."""
+    berhasil; kegagalan dihitung per (user, IP) dan per IP dalam jendela waktu.
+    Teks username tidak disimpan: user yang salah mengetik password di kolom username tidak meninggalkan
+    password-nya di tabel ini. Username yang tidak ada → user_id NULL, hanya terhitung per IP."""
 
     __tablename__ = "login_failures"
     __table_args__ = (
@@ -41,6 +44,6 @@ class LoginFailure(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    username: Mapped[str] = mapped_column(String(USERNAME_MAX_LENGTH))
-    ip: Mapped[str] = mapped_column(String(45))
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    ip: Mapped[str] = mapped_column(String(45))   # kunci rate limit: IPv4, atau prefix /64 untuk IPv6
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), index=True)

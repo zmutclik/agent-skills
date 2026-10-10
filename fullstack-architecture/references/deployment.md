@@ -61,6 +61,8 @@ Review hasil autogenerate: `database.md` §3. Uji dua arah: `references/testing.
 - Static dari `app/static/` di-serve langsung oleh nginx. `app.mount("/static")` hanya aktif bila `DEBUG=true`.
 - `limit_req` hanya untuk `POST /login` (lapis pertama rate limit login, `auth.md` §5): `map $request_method` memberi key kosong untuk GET, sehingga membuka halaman login tidak memakan jatah. Batasnya per IP, jadi pengguna di balik satu NAT berbagi jatah: `30r/m burst=20`; sesuaikan dengan jumlah pengguna per IP.
 - Static: URL dari `static_url()` membawa `?v=<hash isi file>` dan diberi `expires max` (`map $arg_v`); tanpa `?v=` 1 jam. Deploy baru otomatis memakai CSS/JS baru tanpa menunggu cache habis. Static di-serve dari `./app/static` di host: pastikan isinya dari commit yang sama dengan image.
+- `X-Request-ID` ditimpa dengan `$request_id` nginx: ID kiriman client tidak sampai ke log app dan `jobs.request_id`. Ada LB di depan yang membuat ID sendiri: teruskan header LB itu. App tetap menolak format yang tidak wajar (lapis kedua).
+- **Endpoint mahal selain login** (pencarian, ekspor, upload, aksi yang meng-enqueue job): tambahkan `limit_req_zone` + `location` sendiri, pola sama dengan `/login`. Tanpa itu satu client bisa menghabiskan pool DB atau antrean.
 - `X-Forwarded-For` ditimpa dengan `$remote_addr` (§1). Bila TLS diterminasi LB/Caddy **di depan** nginx, aktifkan `set_real_ip_from <IP LB>` + `real_ip_header X-Forwarded-For` (contoh di `deploy/nginx.conf`). Tanpa itu `$remote_addr` adalah IP LB: `limit_req` dan lockout per-IP berlaku untuk semua user sekaligus.
 - TLS diterminasi di proxy. Tambahkan `Strict-Transport-Security` di blok server TLS. HSTS tidak dipasang di app, karena header itu hanya bermakna di HTTPS.
 - `proxy_http_version 1.1` + `Connection ""` + `keepalive` di upstream, agar koneksi ke uvicorn dipakai ulang.
@@ -98,7 +100,7 @@ Checklist review kode ada di SKILL.md §9; di sini hanya hal operasional.
 
 - [ ] `.env` production: `SECRET_KEY` dari `secrets.token_urlsafe(48)` (aplikasi menolak < 32 karakter), `COOKIE_SECURE=true`, `DEBUG=false`.
 - [ ] `FORWARDED_ALLOW_IPS` = IP/subnet proxy (bukan `*`); proxy menimpa `X-Forwarded-For`; `real_ip` aktif bila ada LB di depan nginx (§1, §5).
-- [ ] `uv.lock` dan file vendor JS di-commit (§1); CI (`.github/workflows/ci.yml`) hijau di MariaDB asli.
+- [ ] `uv.lock` dan file vendor JS di-commit (§1); CI (`.github/workflows/ci.yml`) hijau di MariaDB asli, termasuk `pip-audit`; Dependabot (`.github/dependabot.yml`) aktif dan PR-nya di-review rutin.
 - [ ] Database `utf8mb4` (§6); migrasi berjalan sebagai langkah deploy terpisah (§2).
 - [ ] Admin pertama dibuat lewat `python -m app.auth.cli create-user` (§1).
 - [ ] Cleanup auth terjadwal, atau addon jobs terpasang (§1).

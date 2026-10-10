@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 import uuid
 from contextvars import ContextVar
@@ -11,6 +12,9 @@ _RESERVED = set(vars(logging.makeLogRecord({}))) | {"message", "asctime"}
 access_logger = logging.getLogger("app.access")
 # Health check dipanggil tiap beberapa detik oleh orchestrator/LB: tidak dicatat agar log tidak tenggelam
 QUIET_PATHS = frozenset({"/healthz", "/readyz"})
+# X-Request-ID dari luar hanya dipakai bila formatnya wajar. nginx menimpanya dengan $request_id (deploy/nginx.conf),
+# jadi nilai dari client tidak sampai ke sini di production; pemeriksaan ini lapis kedua.
+_REQUEST_ID_FORMAT = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 class JsonFormatter(logging.Formatter):
@@ -49,8 +53,8 @@ class RequestIdMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
 
-        incoming = dict(scope["headers"]).get(b"x-request-id", b"").decode("latin-1")[:64]
-        request_id = incoming or uuid.uuid4().hex
+        incoming = dict(scope["headers"]).get(b"x-request-id", b"").decode("latin-1")
+        request_id = incoming if _REQUEST_ID_FORMAT.fullmatch(incoming) else uuid.uuid4().hex
         token = request_id_var.set(request_id)
         started = time.perf_counter()
         status = 500                                   # bila exception lolos sebelum header terkirim

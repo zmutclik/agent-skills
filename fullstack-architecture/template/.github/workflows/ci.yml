@@ -1,17 +1,21 @@
-# Test suite di MariaDB asli (bukan SQLite) + lint + build image. references/testing.md
+# Test suite di MariaDB asli (bukan SQLite) + lint + audit kerentanan dependency + build image.
+# references/testing.md. Action di-pin ke commit SHA (tag bisa dipindah pemiliknya); Dependabot
+# (.github/dependabot.yml) mengusulkan versi baru beserta SHA-nya.
 name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 1 * * 1"   # Senin 08:00 WIB: audit kerentanan untuk CVE baru
 
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
 
       # docker run, bukan `services:`: service container GitHub tidak bisa diberi argumen server (charset)
       - name: Start MariaDB (utf8mb4, UTC)
@@ -23,7 +27,7 @@ jobs:
             mariadb:11.4 \
             --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-time-zone=+00:00
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e   # v6.8.0
         with:
           version: "0.12"
 
@@ -49,10 +53,25 @@ jobs:
           TEST_DATABASE_URL: mysql+asyncmy://app:app@127.0.0.1:3306/app_test
         run: uv run pytest
 
+  audit:
+    # Gagal bila dependency production di uv.lock punya kerentanan yang diketahui (database PyPA/OSV).
+    # Juga jalan tiap minggu: CVE baru muncul walau kode tidak berubah.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e   # v6.8.0
+        with:
+          version: "0.12"
+      - name: pip-audit (uv.lock, tanpa dev)
+        run: |
+          uv export --locked --no-dev --no-emit-project --format requirements-txt -o requirements.txt
+          uvx pip-audit --strict --disable-pip --no-deps -r requirements.txt
+
   image:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
       - name: Build image
         run: docker build -t app:ci .

@@ -17,6 +17,11 @@ filter `localtime`, checksum vendor JS, dan CI.
 Review 2026-10-10 di MariaDB 11.4: menemukan dan memperbaiki migrasi yang tidak mencatat `alembic_version`
 (`migrations/env.py`; deploy kedua gagal "Table already exists") dan menambah guard nama database test `*_test`.
 Test suite lulus dua kali berturut-turut di database yang sama: 43 test inti, 58 dengan kedua addon; ruff bersih.
+Review 2026-10-10 (lanjutan) di MariaDB 11.4.8: request ID dari nginx + validasi format, kebijakan password & role
+di service, `change_role` aman untuk user yang tidak ada, rate limit IPv6 per /64, `login_failures` menyimpan
+`user_id` (bukan teks username), `historyCacheSize: 0`, CLI token addon api-tokens, watchdog worker addon jobs,
+CI dengan action ber-SHA + `pip-audit` + Dependabot. Hasil: 51 test inti, 70 dengan kedua addon, lulus dua kali
+berturut-turut; ruff bersih; uji mutasi untuk setiap perbaikan tertangkap.
 Uji mutasi `references/testing.md` §4 diulang sebagian (SKIP LOCKED, filter `owner_id`, CSRF, semaphore argon2,
 `max_statement_time`): semua tertangkap. Tetap jalankan test suite (di bawah) untuk konfigurasi yang dipakai sebelum rilis.
 

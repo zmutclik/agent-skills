@@ -63,10 +63,11 @@ Penamaan: folder domain snake_case jamak, fragment `_nama.html`, komponen Alpine
 ## 5. Auth (detail: `references/auth.md`)
 
 - Session ID acak di cookie `HttpOnly; Secure; SameSite=Lax`; DB hanya menyimpan hash SHA-256. Idle timeout diperpanjang di DB, dibatasi umur mutlak; `max_age` cookie = umur mutlak.
-- Rate limit login per (username, IP) + per IP, **bukan** per username saja (cegah penguncian akun orang lain).
+- Rate limit login per (user, IP) + per IP, **bukan** per user saja (cegah penguncian akun orang lain). IPv6 dihitung per prefix /64; `login_failures` menyimpan `user_id`, bukan teks username.
 - Dependency auth memakai **session DB sendiri** (`async_session_factory`), bukan `Depends(get_db)`, agar `db.begin()` di service tidak gagal karena autobegin.
 - CSRF HMAC untuk semua non-GET (`hx-headers` di `<body>`, hidden input untuk form biasa); login memakai double-submit cookie.
 - `role` disalin ke session → perubahan role/password **wajib** menghapus session user itu (`change_role`, `change_password`).
+- Kebijakan password (`validate_password`) dan daftar role (`ROLES`) ditegakkan di **service**, bukan hanya di form/CLI.
 - Admin pertama & reset password lewat `python -m app.auth.cli` (password dari prompt/stdin, bukan argumen).
 - Otorisasi: `require_role(...)`, dan data milik user **difilter di query** (`owner_id`), bukan hanya disembunyikan di template.
 - Token M2M / JWT hanya bila client-nya benar-benar ada (`addons/api-tokens`, lihat `references/auth.md`).
@@ -96,8 +97,9 @@ Penamaan: folder domain snake_case jamak, fragment `_nama.html`, komponen Alpine
 ## 8. Error, Security, Config
 
 - Error handler sadar-HTMX: HTMX → toast + `HX-Retarget: #toast`; browser → `error.html`; `/api/` → JSON; detail 5xx tidak pernah bocor. `RequestValidationError` (query/path tidak valid) juga lewat jalur ini, kecuali `/api/`. Exception tak tertangani lewat `UnhandledErrorMiddleware` (paling dalam), bukan `exception_handler(Exception)`. → `core/errors.py`
-- Security headers & request ID lewat pure ASGI middleware (bukan `BaseHTTPMiddleware`); log JSON ber-`request_id`, satu log `request` (status, `duration_ms`) per request sebagai bahan metrics. HSTS di proxy.
+- Security headers & request ID lewat pure ASGI middleware (bukan `BaseHTTPMiddleware`); request ID dibuat nginx (`$request_id`), nilai dari luar hanya dipakai bila formatnya wajar; log JSON ber-`request_id`, satu log `request` (status, `duration_ms`) per request sebagai bahan metrics. HSTS di proxy.
 - Respons app default `Cache-Control: no-store` (data per user); endpoint yang aman di-cache memasang header sendiri.
+- Rate limit hanya ada untuk login. Endpoint mahal (pencarian, ekspor, enqueue job) diberi `limit_req` sendiri di nginx (`references/deployment.md` §5).
 - Konfigurasi lewat `pydantic-settings`. `SECRET_KEY` ≥ 32 karakter (divalidasi saat start), hanya untuk signing, bukan enkripsi. Halaman awal (redirect `/` dan setelah login) = `HOME_PATH`.
 - `/readyz` memakai koneksi di luar pool web: pool penuh saat lonjakan bukan alasan mengeluarkan instance dari load balancer. Maks. satu probe DB per proses per detik, dan health check tidak dibuka ke publik (nginx `deny`).
 
@@ -110,4 +112,4 @@ Penamaan: folder domain snake_case jamak, fragment `_nama.html`, komponen Alpine
 - [ ] Data user difilter `owner_id`; `require_role` untuk aksi admin; CSRF di semua non-GET.
 - [ ] Error 5xx tidak membocorkan detail; arah dependency sesuai §3.
 - [ ] Addon dipakai hanya bila dibutuhkan, dan aturan di reference-nya dipenuhi.
-- [ ] Test suite lulus di MariaDB asli; operasional: `references/deployment.md` §8.
+- [ ] Test suite lulus di MariaDB asli; CI (`pip-audit`) hijau; operasional: `references/deployment.md` §8.

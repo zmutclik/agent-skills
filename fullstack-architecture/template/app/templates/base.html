@@ -3,8 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  {# CSP ketat: htmx tanpa eval & tanpa style inline #}
-  <meta name="htmx-config" content='{"allowEval": false, "includeIndicatorStyles": false}'>
+  {# CSP ketat: htmx tanpa eval & tanpa style inline. historyCacheSize 0: snapshot halaman (data user, token CSRF)
+     tidak disimpan di localStorage, yang tetap ada setelah logout; back/forward meminta ulang ke server. #}
+  <meta name="htmx-config" content='{"allowEval": false, "includeIndicatorStyles": false, "historyCacheSize": 0}'>
   <title>{% block title %}App{% endblock %}</title>
   <link rel="stylesheet" href="{{ static_url('css/app.css') }}">
   {# static_url(): ?v=<hash isi file> agar deploy baru tidak memakai JS/CSS lama dari cache #}

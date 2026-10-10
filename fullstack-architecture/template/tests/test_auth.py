@@ -161,12 +161,12 @@ async def test_cleanup_purges_expired_sessions_and_old_failures():
     async with async_session_factory() as db, db.begin():
         db.add(UserSession(id="a" * 64, user_id=user.id, role="user", expires_at=text("NOW() - INTERVAL 1 MINUTE")))
         db.add(UserSession(id="b" * 64, user_id=user.id, role="user", expires_at=text("NOW() + INTERVAL 1 HOUR")))
-        db.add(LoginFailure(username="x", ip="10.0.0.1", created_at=text("NOW() - INTERVAL 1 DAY")))
-        db.add(LoginFailure(username="y", ip="10.0.0.1"))
+        db.add(LoginFailure(ip="10.0.0.1", created_at=text("NOW() - INTERVAL 1 DAY")))
+        db.add(LoginFailure(ip="10.0.0.2"))
     await purge_auth_rows(async_session_factory)
     async with async_session_factory() as db:
         assert list(await db.scalars(select(UserSession.id))) == ["b" * 64]
-        assert list(await db.scalars(select(LoginFailure.username))) == ["y"]
+        assert list(await db.scalars(select(LoginFailure.ip))) == ["10.0.0.2"]
 
 
 async def test_password_hashing_concurrency_is_bounded(monkeypatch):
@@ -213,7 +213,8 @@ async def test_parallel_login_attempts_cannot_bypass_limit(monkeypatch):
 
 
 async def test_overlong_username_is_rejected_not_500(client):
-    # Tanpa pengecekan panjang, INSERT ke login_failures.username gagal "Data too long" (mode strict) → 500
+    # Username tidak pernah di-INSERT (login_failures menyimpan user_id), jadi panjang berapa pun tidak memicu
+    # "Data too long" (mode strict) → 500
     page = await client.get("/login")
     resp = await client.post("/login", data={
         "username": "a" * (USERNAME_MAX_LENGTH + 1), "password": "x", "csrf_token": page.cookies["login_csrf"],
@@ -256,3 +257,66 @@ async def test_cli_bootstraps_admin_and_resets_password():
     async with async_session_factory() as db:
         assert await db.scalar(select(UserSession)) is None                       # session lama dicabut
     assert await service_login("root", "rahasia-baru", "10.0.0.1") is not None
+
+
+async def test_lockout_counts_collation_variants_as_one_user():
+    # Collation _ci menganggap Alice = alice: tebakan dengan variasi huruf tetap satu hitungan per user
+    await make_user()
+    for name in ("alice", "Alice", "ALICE", "aLice", "alicE"):
+        assert await service_login(name, "salah", "10.0.0.1") is None
+    with pytest.raises(auth_service.TooManyAttempts):
+        await service_login("ALIce", "s3cret-pass", "10.0.0.1")
+
+
+async def test_login_failures_do_not_store_typed_username():
+    # User yang salah mengetik password di kolom username tidak meninggalkan password itu di DB
+    assert await service_login("password-rahasia-ku", "x", "10.0.0.1") is None
+    async with async_session_factory() as db:
+        row = (await db.execute(text("SELECT * FROM login_failures"))).mappings().one()
+    assert "password-rahasia-ku" not in map(str, row.values())
+
+
+def test_rate_limit_key_groups_ipv6_by_64_prefix():
+    key = auth_service.rate_limit_key
+    assert key("203.0.113.9") == "203.0.113.9"
+    assert key("2001:db8:1:2:aaaa::1") == key("2001:db8:1:2:ffff::9") == "2001:db8:1:2::/64"
+    assert key("2001:db8:1:3::1") != key("2001:db8:1:2::1")
+    assert key("::ffff:203.0.113.9") == "203.0.113.9"      # IPv4-mapped = klien IPv4
+    assert key("unknown") == "unknown"
+
+
+async def test_lockout_cannot_be_bypassed_by_rotating_ipv6_in_one_prefix():
+    await make_user()
+    for i in range(settings.LOGIN_MAX_FAILURES):
+        assert await service_login("alice", "salah", f"2001:db8:1:2::{i + 1:x}") is None
+    with pytest.raises(auth_service.TooManyAttempts):
+        await service_login("alice", "s3cret-pass", "2001:db8:1:2:dead:beef::1")
+    assert await service_login("alice", "s3cret-pass", "2001:db8:9:9::1") is not None   # prefix lain
+
+
+async def test_password_policy_enforced_in_service():
+    with pytest.raises(auth_service.InvalidPassword):
+        await make_user(password="pendek")
+    user = await make_user()
+    async with async_session_factory() as db:
+        with pytest.raises(auth_service.InvalidPassword):
+            await auth_service.change_password(db, user.id, "pendek")
+    assert await service_login("alice", "s3cret-pass", "10.0.0.1") is not None          # password lama utuh
+
+
+async def test_role_must_be_known_and_user_must_exist():
+    with pytest.raises(ValueError):
+        await make_user(role="admn")
+    user = await make_user()
+    async with async_session_factory() as db:
+        with pytest.raises(ValueError):
+            await auth_service.change_role(db, user.id, "superuser")
+        assert await auth_service.change_role(db, user.id, "user") is True              # role sama: tetap True
+        assert await auth_service.change_role(db, user.id + 999, "admin") is False      # bukan AttributeError
+
+
+async def test_cli_rejects_unknown_role():
+    code, out = await cli("create-user", "carol", "--role", "admn", stdin="rahasia-awal\n")
+    assert code != 0 and "invalid choice" in out
+    async with async_session_factory() as db:
+        assert await db.scalar(select(User)) is None

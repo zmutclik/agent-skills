@@ -11,6 +11,8 @@ class JobSettings(BaseSettings):
     WORKER_SHUTDOWN_GRACE: float = 25    # < stop_grace_period / terminationGracePeriodSeconds
     JOB_TIMEOUT: int = 300
     DB_JOB_STATEMENT_TIMEOUT: float = 60  # engine worker; engine web tetap DB_STATEMENT_TIMEOUT
+    # Event loop tidak berdetak selama ini (kode sync memblok) → proses exit 1 agar di-restart. 0 = nonaktif.
+    WORKER_WATCHDOG_TIMEOUT: float = 120
 
 
 job_settings = JobSettings()

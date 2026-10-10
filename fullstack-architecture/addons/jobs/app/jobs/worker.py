@@ -1,7 +1,11 @@
 """Worker job queue MariaDB. Jalankan: python -m app.jobs.worker"""
 import asyncio
 import logging
+import os
 import signal
+import threading
+import time
+from collections.abc import Callable
 
 import httpx
 from sqlalchemy import Row, func, select, update
@@ -21,6 +25,7 @@ MAINTENANCE_INTERVAL = 60
 MAINTENANCE_LOCK = func.concat(func.database(), ".maintenance")
 CLAIM_BATCH_DELAY = 0.05               # tunggu sebentar agar satu claim mengambil beberapa slot sekaligus
 MAX_CLAIM_BACKOFF = 30                 # detik; batas jeda saat claim gagal berturut-turut (DB down)
+WATCHDOG_BEAT = 1.0                    # detik antar-detak event loop
 
 
 async def claim(db_factory, limit: int) -> list[Row]:
@@ -184,6 +189,43 @@ async def run(stop: asyncio.Event, *, concurrency: int | None = None,
         await engine.dispose()
 
 
+def _exit_stalled() -> None:
+    logger.critical("worker_stalled", extra={"timeout": job_settings.WORKER_WATCHDOG_TIMEOUT})
+    os._exit(1)                                       # event loop macet: shutdown normal tidak akan jalan
+
+
+class Watchdog:
+    """Event loop yang macet (kode sync memblok di dalam task) tidak membuat proses mati, sehingga restart policy
+    orchestrator/compose tidak pernah bekerja dan antrean diam-diam berhenti. Thread terpisah memeriksa detak
+    dari event loop; bila berhenti lebih dari `timeout`, proses diakhiri. Job yang tertinggal 'running'
+    dikembalikan reclaim_stale (task wajib idempotent)."""
+
+    def __init__(self, timeout: float, on_stall: Callable[[], None] = _exit_stalled):
+        self.timeout = timeout
+        self.on_stall = on_stall
+        self._last_beat = time.monotonic()
+        self._stopped = threading.Event()
+
+    async def beat(self) -> None:
+        while True:
+            self._last_beat = time.monotonic()
+            await asyncio.sleep(min(WATCHDOG_BEAT, self.timeout / 4))
+
+    def _watch(self) -> None:
+        while not self._stopped.wait(min(WATCHDOG_BEAT, self.timeout / 4)):
+            if time.monotonic() - self._last_beat > self.timeout:
+                self.on_stall()
+                return
+
+    def start(self) -> asyncio.Task:
+        self._last_beat = time.monotonic()
+        threading.Thread(target=self._watch, name="worker-watchdog", daemon=True).start()
+        return asyncio.create_task(self.beat())
+
+    def stop(self) -> None:
+        self._stopped.set()
+
+
 def main() -> None:
     setup_logging()
 
@@ -192,8 +234,17 @@ def main() -> None:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, stop.set)
+        watchdog = beats = None
+        if job_settings.WORKER_WATCHDOG_TIMEOUT > 0:
+            watchdog = Watchdog(job_settings.WORKER_WATCHDOG_TIMEOUT)
+            beats = watchdog.start()
         logger.info("worker_started")
-        await run(stop)
+        try:
+            await run(stop)
+        finally:
+            if watchdog:
+                watchdog.stop()
+                beats.cancel()
         logger.info("worker_stopped")
 
     asyncio.run(_main())

@@ -3,6 +3,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import httpx
@@ -19,6 +20,7 @@ from app.jobs.config import job_settings
 from app.jobs.models import Job
 from app.jobs.queue import enqueue
 from app.jobs.tasks import reclaim_stale
+from app.jobs.worker import Watchdog
 from tests import support_tasks
 from tests.conftest import PROJECT_DIR, htmx_headers, login, make_user
 
@@ -276,3 +278,32 @@ async def test_auth_cleanup_runs_as_maintenance():
     await worker.run_maintenance(engine)
     async with async_session_factory() as db:
         assert list(await db.scalars(select(UserSession.id))) == ["b" * 64]
+
+
+def test_watchdog_fires_only_when_event_loop_is_blocked():
+    async def scenario(block: float) -> bool:
+        stalled = threading.Event()
+        watchdog = Watchdog(0.3, on_stall=stalled.set)
+        beats = watchdog.start()
+        await asyncio.sleep(0.6)                          # loop sehat: detak terus jalan
+        healthy = not stalled.is_set()
+        time.sleep(block)                                 # loop diblok kode sync
+        await asyncio.sleep(0)
+        watchdog.stop()
+        beats.cancel()
+        return healthy and stalled.is_set()
+
+    assert asyncio.run(scenario(block=1.0))
+    assert not asyncio.run(scenario(block=0))
+
+
+async def test_worker_process_exits_when_event_loop_stalls():
+    await enqueue_many("test.block_loop", [{"seconds": 30}])
+    env = {**os.environ, **FAST_WORKER_ENV, "WORKER_WATCHDOG_TIMEOUT": "1", "PYTHONPATH": PROJECT_DIR}
+    proc = subprocess.Popen([sys.executable, "-m", "tests.worker_runner"], cwd=PROJECT_DIR, env=env)
+    try:
+        returncode = await asyncio.to_thread(proc.wait, 10)
+    finally:
+        proc.kill()
+    assert returncode == 1                                # restart policy bisa memulai ulang worker
+    assert await job_statuses() == {"running": 1}         # dikembalikan reclaim_stale setelah locked_until

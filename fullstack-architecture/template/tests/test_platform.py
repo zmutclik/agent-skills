@@ -83,6 +83,12 @@ async def test_security_and_request_id_headers(client):
     assert resp.headers["x-request-id"] == "abc123"
 
 
+async def test_malformed_request_id_is_replaced(client):
+    for bad in ("a" * 65, "x y", "a/b", "<script>"):
+        rid = (await client.get("/healthz", headers={"X-Request-ID": bad})).headers["x-request-id"]
+        assert rid != bad and len(rid) == 32              # diganti uuid4().hex
+
+
 async def test_db_session_settings_utc_and_statement_timeout():
     async with engine.connect() as conn:
         tz, timeout = (await conn.execute(text("SELECT @@session.time_zone, @@session.max_statement_time"))).one()

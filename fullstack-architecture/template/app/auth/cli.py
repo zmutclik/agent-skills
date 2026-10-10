@@ -13,10 +13,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.auth import service as auth_service
-from app.auth.models import USERNAME_MAX_LENGTH, User
+from app.auth.models import ROLES, USERNAME_MAX_LENGTH, User
 from app.core.database import make_engine
-
-MIN_PASSWORD_LENGTH = 8
 
 
 def read_password() -> str:
@@ -55,15 +53,17 @@ def main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     create = sub.add_parser("create-user")
     create.add_argument("username")
-    create.add_argument("--role", default="user")
+    create.add_argument("--role", default="user", choices=ROLES)   # salah ketik ditolak, bukan user tanpa hak
     sub.add_parser("set-password").add_argument("username")
     args = parser.parse_args(argv)
 
     if not 0 < len(args.username) <= USERNAME_MAX_LENGTH:
         sys.exit(f"Username harus 1–{USERNAME_MAX_LENGTH} karakter.")
     password = read_password()
-    if len(password) < MIN_PASSWORD_LENGTH:
-        sys.exit(f"Password minimal {MIN_PASSWORD_LENGTH} karakter.")
+    try:
+        auth_service.validate_password(password)        # cek sebelum konek DB; service tetap memeriksa ulang
+    except auth_service.InvalidPassword as err:
+        sys.exit(str(err))
     asyncio.run(run(args, password))
 
 

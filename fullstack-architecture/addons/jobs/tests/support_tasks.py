@@ -1,6 +1,7 @@
 """Task khusus test. Didaftarkan dengan mengimpor modul ini (worker produksi tidak melihatnya)."""
 import asyncio
 import random
+import time
 from collections import Counter
 
 from app.jobs.queue import report_progress, task
@@ -28,3 +29,8 @@ async def call_api(ctx: dict, path: str) -> None:
 async def sleep(ctx: dict, seconds: float) -> None:
     await report_progress(ctx, 10)
     await asyncio.sleep(seconds)
+
+
+@task("test.block_loop")
+async def block_loop(ctx: dict, seconds: float) -> None:
+    time.sleep(seconds)                               # BUG yang disengaja: kode sync memblok event loop

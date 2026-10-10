@@ -20,7 +20,7 @@ Setelah itu:
      restart: unless-stopped
      logging: *default-logging       # anchor di atas docker-compose.yml
    ```
-2. **`.env.example`**: `WORKER_CONCURRENCY=10`, `WORKER_SHUTDOWN_GRACE=25` (setting lain di `app/jobs/config.py`).
+2. **`.env.example`**: `WORKER_CONCURRENCY=10`, `WORKER_SHUTDOWN_GRACE=25`, `WORKER_WATCHDOG_TIMEOUT=120` (setting lain di `app/jobs/config.py`).
 3. **Hapus jadwal cron** `python -m app.auth.cleanup`: `app/auth/tasks.py` menjalankannya lewat `@maintenance`.
 
 Router, task, dan model ditemukan otomatis; `core/config.py` tidak diedit.
@@ -84,6 +84,7 @@ async def push_to_erp(ctx: dict, order_id: int) -> None:
 - **Error DB sesaat** (koneksi putus, deadlock, failover): claim yang gagal dicatat lalu dicoba lagi dengan backoff (maks. `MAX_CLAIM_BACKOFF` 30 detik); worker dan job yang sedang berjalan tidak ikut mati. Gagal menulis status akhir job juga hanya dicatat; job itu diambil lagi oleh `reclaim_stale`.
 - **Worker mati mendadak**: `reclaim_stale` mengembalikan job yang `locked_until`-nya lewat.
 - **SIGTERM**: berhenti claim, tunggu job sampai `WORKER_SHUTDOWN_GRACE`, sisanya kembali ke `queued` tanpa menambah `attempts`.
+- **Watchdog**: thread terpisah memeriksa detak event loop. Kode sync yang memblok loop lebih dari `WORKER_WATCHDOG_TIMEOUT` (120 detik) membuat proses exit 1 (log `worker_stalled`), sehingga `restart: unless-stopped`/orchestrator memulai ulang worker. Tanpa ini proses tetap hidup tapi antrean diam-diam berhenti. Job yang tertinggal `running` dikembalikan `reclaim_stale`.
 - Worker terpisah per jenis task hanya bila job lambat mulai menahan job cepat.
 
 ## 5. Polling status & operasional
@@ -96,4 +97,4 @@ async def push_to_erp(ctx: dict, order_id: int) -> None:
 
 ## 6. Test wajib (sudah ada di `tests/test_worker.py`)
 
-Outbox ikut rollback dan request ID terbawa · polling status hanya untuk pemilik dan 286 saat selesai · 3 worker × 300 job, setiap job tepat sekali · claim per batch (≥ 5 job per claim) · retry + backoff · worker bertahan saat claim gagal sesaat · task tak terdaftar langsung `failed` · reclaim job macet · HTTP client diinjeksi (`httpx.MockTransport`, tanpa API sungguhan) · SIGTERM pada proses asli · purge backlog > `BATCH_LIMIT` dalam satu putaran · maintenance hanya pada pemegang `GET_LOCK` · cleanup auth jalan sebagai maintenance.
+Outbox ikut rollback dan request ID terbawa · polling status hanya untuk pemilik dan 286 saat selesai · 3 worker × 300 job, setiap job tepat sekali · claim per batch (≥ 5 job per claim) · retry + backoff · worker bertahan saat claim gagal sesaat · task tak terdaftar langsung `failed` · reclaim job macet · HTTP client diinjeksi (`httpx.MockTransport`, tanpa API sungguhan) · SIGTERM pada proses asli · purge backlog > `BATCH_LIMIT` dalam satu putaran · maintenance hanya pada pemegang `GET_LOCK` · cleanup auth jalan sebagai maintenance · watchdog mengakhiri proses saat event loop diblok kode sync.

@@ -8,6 +8,7 @@ Aturan inti ada di SKILL.md §6. File acuan: `template/app/core/database.py`, `t
 - **Pool**: `pool_pre_ping`, `pool_recycle=1800`, `pool_timeout=5` (fail-fast), `expire_on_commit=False`. `pool_pre_ping` menambah satu round-trip per checkout sebagai ganti request gagal setelah DB restart/failover; pertahankan kecuali profiling menunjukkan ping dominan.
 - **Charset**: koneksi asyncmy sudah `utf8mb4`, tapi tabel mewarisi charset **database**. Database wajib `utf8mb4` (`deployment.md` §6); `migrations/env.py` memeriksanya sebelum migrasi.
 - **Engine terpisah** (`make_engine()`) untuk Alembic, skrip (`app/auth/cleanup.py`), dan worker addon jobs, karena `max_statement_time` web juga berlaku untuk `ALTER TABLE` dan kerja panjang.
+- **Driver**: `asyncmy` dipilih karena performa, tapi dirawat oleh sedikit orang. Bila rilisnya macet atau ada bug/CVE yang tidak diperbaiki, jalur keluarnya `aiomysql`: ganti dependency dan skema URL (`mysql+aiomysql://`), lalu jalankan test suite. Kode app tidak bergantung pada driver.
 - **`DbSession` dengan `scope="function"`**: koneksi dikembalikan begitu handler selesai, sebelum response dikirim; client lambat tidak menahan koneksi pool.
 
 ## 2. Kapasitas koneksi
