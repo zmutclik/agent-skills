@@ -1,0 +1,58 @@
+# Test suite di MariaDB asli (bukan SQLite) + lint + build image. references/testing.md
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # docker run, bukan `services:`: service container GitHub tidak bisa diberi argumen server (charset)
+      - name: Start MariaDB (utf8mb4, UTC)
+        run: |
+          docker run -d --name mariadb -p 127.0.0.1:3306:3306 \
+            -e MARIADB_ROOT_PASSWORD=root -e MARIADB_DATABASE=app_test \
+            -e MARIADB_USER=app -e MARIADB_PASSWORD=app \
+            --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 2s \
+            mariadb:11.4 \
+            --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-time-zone=+00:00
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12"
+
+      - name: Install dependencies (uv.lock wajib sinkron)
+        run: uv sync --locked
+
+      - name: Vendor JS di-commit
+        run: test -s app/static/js/vendor/htmx.min.js && test -s app/static/js/vendor/alpine-csp.min.js
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Wait for MariaDB
+        run: |
+          for _ in $(seq 60); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' mariadb)" = healthy ] && exit 0
+            sleep 2
+          done
+          docker logs mariadb; exit 1
+
+      - name: Test
+        env:
+          TEST_DATABASE_URL: mysql+asyncmy://app:app@127.0.0.1:3306/app_test
+        run: uv run pytest
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t app:ci .

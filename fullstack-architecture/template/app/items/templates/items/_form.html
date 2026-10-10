@@ -1,0 +1,9 @@
+<form id="item-form" hx-post="/items" hx-target="#item-rows" hx-swap="afterbegin">
+  <label>Nama
+    <input name="name" value="{{ form.get('name', '') if form else '' }}" required maxlength="200">
+  </label>
+  {% for error in errors or [] %}
+  <p class="error">{{ error.loc | join(".") }}: {{ error.msg }}</p>
+  {% endfor %}
+  <button type="submit">Simpan</button>
+</form>

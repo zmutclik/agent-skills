@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {# CSP ketat: htmx tanpa eval & tanpa style inline #}
+  <meta name="htmx-config" content='{"allowEval": false, "includeIndicatorStyles": false}'>
+  <title>{% block title %}App{% endblock %}</title>
+  <link rel="stylesheet" href="{{ static_url('css/app.css') }}">
+  {# static_url(): ?v=<hash isi file> agar deploy baru tidak memakai JS/CSS lama dari cache #}
+  {# Urutan wajib: htmx, app.js, komponen Alpine, Alpine (build CSP) PALING AKHIR #}
+  <script defer src="{{ static_url('js/vendor/htmx.min.js') }}"></script>
+  <script defer src="{{ static_url('js/app.js') }}"></script>
+  {# Komponen Alpine diisi oleh halaman yang memakainya: menambah domain tidak mengedit file ini #}
+  {% block scripts %}{% endblock %}
+  <script defer src="{{ static_url('js/vendor/alpine-csp.min.js') }}"></script>
+</head>
+<body{% if csrf_token %} hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'{% endif %}>
+  <div id="toast" aria-live="polite"></div>
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>

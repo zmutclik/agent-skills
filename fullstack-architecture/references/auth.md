@@ -1,0 +1,63 @@
+# Auth: Detail
+
+Aturan inti ada di SKILL.md §5. File acuan: `template/app/auth/`.
+
+## 1. Session
+
+- Tabel `user_sessions` dengan PK = SHA-256 session ID; nilai asli hanya ada di cookie.
+- **`last_seen_at` di-throttle**: diperbarui (dan `expires_at` diperpanjang) maksimal sekali per `TOUCH_INTERVAL` (5 menit), bukan UPDATE setiap request.
+- **Dua batas waktu**: idle timeout `SESSION_TTL` (7 hari, diperpanjang saat aktif) dan batas mutlak `SESSION_MAX_AGE` (30 hari sejak login, `expires_at` tidak pernah melewati `created_at + SESSION_MAX_AGE`). Cookie dipasang sekali dengan `max_age=SESSION_MAX_AGE` dan tidak diperbarui; server yang memutuskan kapan session berakhir. Jangan set `max_age` cookie = idle timeout: browser membuang cookie walau session di DB masih diperpanjang.
+- `role` disalin ke session agar tidak perlu join setiap request; `change_role` menghapus semua session user tersebut.
+- Request HTMX yang belum login mendapat `401` + `HX-Redirect: /login`; browser biasa mendapat redirect 303.
+- **Pembersihan**: `python -m app.auth.cleanup` menghapus session kedaluwarsa dan catatan login lama (per batch). Jadwalkan tiap jam (cron/systemd timer/CronJob). Dengan addon jobs, fungsi yang sama berjalan otomatis lewat `@maintenance`.
+
+## 2. Manajemen user
+
+- `change_role` dan `change_password` menghapus semua session user tersebut dalam transaksi yang sama.
+- Admin pertama dan reset password dari terminal (`app/auth/cli.py`):
+  ```bash
+  python -m app.auth.cli create-user admin --role admin
+  python -m app.auth.cli set-password admin
+  ```
+  Password dibaca dari prompt (dua kali), atau satu baris stdin bila bukan terminal; tidak pernah dari argumen (tercatat di riwayat shell dan daftar proses). Minimal 8 karakter.
+
+## 3. CSRF
+
+- Token = HMAC(`SECRET_KEY`, hash session ID); dicek `require_csrf` untuk semua method non-GET.
+- HTMX mengirimnya lewat `hx-headers` di `<body>`; form biasa lewat hidden input `csrf_token`.
+- Form login (belum ada session) memakai double-submit cookie (`login_csrf`, `SameSite=Strict`, `path=/login`) tanpa menulis ke DB.
+
+## 4. Login
+
+- Selalu buat session ID baru (cegah session fixation).
+- argon2 dijalankan di threadpool **dan** di luar transaksi, dibatasi `PASSWORD_HASH_CONCURRENCY` per proses (default 4). Tiap hash memakai ±64 MiB; tanpa batas, lonjakan login memakai seluruh threadpool (40 thread) dan RAM.
+- Username yang tidak ada tetap diverifikasi terhadap hash dummy, agar waktu respons tidak membocorkan username valid.
+- Username kosong atau > `USERNAME_MAX_LENGTH` langsung ditolak sebagai kredensial salah, sebelum INSERT `login_failures` (mode strict MariaDB menolak nilai terlalu panjang → 500).
+
+## 5. Rate limit login (dua lapis)
+
+1. `limit_req` di nginx, hanya untuk `POST /login` (`deployment.md` §5).
+2. Tabel `login_failures` dalam `LOGIN_FAILURE_WINDOW`, dua batas:
+   - per pasangan (username, IP): `LOGIN_MAX_FAILURES` (5);
+   - per IP untuk semua username: `LOGIN_MAX_FAILURES_PER_IP` (50), longgar karena satu kantor di balik NAT berbagi IP.
+   - **Tidak ada batas per username saja**: dengan batas itu, siapa pun bisa mengunci akun korban dari IP mana pun (DoS lockout). Konsekuensinya, tebakan terdistribusi dari banyak IP ke satu akun hanya dibatasi per IP; andalkan argon2 + kebijakan password, atau tambahkan MFA bila ancaman itu nyata.
+   - Percobaan dicatat dan di-commit **sebelum** dihitung. Dengan hitung-dulu-catat-belakangan, request paralel membaca hitungan lama dan lolos semua.
+   - Percobaan yang ditolak ikut tercatat (serangan berkelanjutan memperpanjang blokir, tapi hanya untuk pasangan/IP penyerang); baris pasangan (username, IP) dihapus bila login berhasil.
+   - IP hanya benar bila proxy menimpa `X-Forwarded-For` dan uvicorn hanya mempercayai IP proxy (`deployment.md` §1).
+
+## 6. Addon `api-tokens` (token M2M)
+
+Pasang hanya bila ada client mesin (ERP, integrasi, cron eksternal) yang memanggil `/api/...`.
+
+```bash
+cp -r <skill>/addons/api-tokens/. ./
+uv run alembic revision --autogenerate -m "add api_tokens"   # review, lalu upgrade head
+```
+
+Tidak ada file lain yang perlu diedit (auto-discovery). Isinya:
+- `api_tokens` menyimpan hash + `scopes` (dipisah spasi) + `expires_at`/`revoked_at`; pencabutan langsung berlaku.
+- `require_scope("items:read")` sebagai dependency router `/api/...` (error handler membalas JSON untuk path `/api/`).
+- `last_used_at` di-throttle seperti session; dependency memakai session DB sendiri.
+- Test: `tests/test_api_tokens.py`.
+
+Mobile/SPA beda domain: JWT, hanya saat client itu benar-benar ada.

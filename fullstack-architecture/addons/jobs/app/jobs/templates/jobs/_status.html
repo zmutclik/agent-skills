@@ -1,0 +1,4 @@
+<div id="job-{{ job.id }}"
+     {% if not finished %}hx-get="/jobs/{{ job.id }}/status" hx-trigger="every 3s" hx-swap="outerHTML"{% endif %}>
+  {{ job.status }} — {{ job.progress }}%
+</div>

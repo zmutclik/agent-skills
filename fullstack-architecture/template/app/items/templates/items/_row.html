@@ -1,0 +1,10 @@
+<tr id="item-{{ item.id }}">
+  <td>{{ item.name }}</td>
+  <td>{{ item.created_at | localtime }}</td>
+  <td>
+    {% if user.role == "admin" %}
+    <button hx-delete="/items/{{ item.id }}" hx-target="#item-{{ item.id }}" hx-swap="outerHTML"
+            hx-confirm="Hapus item ini?">Hapus</button>
+    {% endif %}
+  </td>
+</tr>

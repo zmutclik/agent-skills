@@ -1,0 +1,8 @@
+{% for item in items %}{% include "items/_row.html" %}{% endfor %}
+{% if next_cursor %}
+<tr id="load-more">
+  <td colspan="3">
+    <button hx-get="/items?before={{ next_cursor }}" hx-target="#load-more" hx-swap="outerHTML">Muat lagi</button>
+  </td>
+</tr>
+{% endif %}

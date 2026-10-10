@@ -1,0 +1,5 @@
+body { font-family: system-ui, sans-serif; max-width: 48rem; margin: 2rem auto; padding: 0 1rem; }
+.error { color: #b00020; }
+.toast { padding: .5rem 1rem; background: #fff3cd; border: 1px solid #e0c36c; }
+table { width: 100%; border-collapse: collapse; }
+td { padding: .4rem; border-bottom: 1px solid #ddd; }

@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Items{% endblock %}
+{% block scripts %}<script defer src="{{ static_url('js/alpine/items.js') }}"></script>{% endblock %}
+{% block content %}
+<section x-data="itemTable" @item-saved.window="handleItemSaved">
+  <h1>Items</h1>
+  {% include "items/_form.html" %}
+  <table>
+    <tbody id="item-rows">{% include "items/_rows.html" %}</tbody>
+  </table>
+  <form method="post" action="/logout">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Keluar</button>
+  </form>
+</section>
+{% endblock %}
